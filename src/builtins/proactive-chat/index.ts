@@ -3,7 +3,11 @@ import type { JsonStore, JsonStoreReadResult } from '../../core/storage.js';
 import type { Message, Session } from '../../core/types.js';
 import type { LLMProvider } from '../../llm/types.js';
 import type { Plugin, PluginContext } from '../../plugins/types.js';
-import { resolveProactiveChatConfig, type ProactiveChatConfig } from '../../config/config.js';
+import {
+  resolveProactiveChatConfig,
+  type ConfigWarnHandler,
+  type ProactiveChatConfig,
+} from '../../config/config.js';
 import { buildContextBundle, type ContextBundle } from './context.js';
 import {
   decide,
@@ -16,6 +20,7 @@ import {
 import { DelayedQueue } from './delayed-queue.js';
 import {
   applyUserMessageCoupling,
+  clamp01,
   DEFAULT_EMOTION_DYNAMICS,
   DEFAULT_EMOTION_STATE,
   EmotionStore,
@@ -51,13 +56,36 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+/** A finite number inside the closed unit interval `[0, 1]`. */
+function isUnitInterval(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0 && value <= 1;
+}
+
 function isEmotionState(value: unknown): value is EmotionState {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Record<string, unknown>;
   return (
-    isFiniteNumber(record['valence']) &&
-    isFiniteNumber(record['arousal']) &&
-    isFiniteNumber(record['socialNeed'])
+    isUnitInterval(record['valence']) &&
+    isUnitInterval(record['arousal']) &&
+    isUnitInterval(record['socialNeed'])
+  );
+}
+
+/** Clamp every emotion field into `[0, 1]` (defense in depth on restore). */
+function clampEmotionState(state: EmotionState): EmotionState {
+  return {
+    valence: clamp01(state.valence),
+    arousal: clamp01(state.arousal),
+    socialNeed: clamp01(state.socialNeed),
+  };
+}
+
+/** Whether a state is exactly the pristine default (i.e. carries no signal). */
+function isDefaultEmotion(state: EmotionState): boolean {
+  return (
+    state.valence === DEFAULT_EMOTION_STATE.valence &&
+    state.arousal === DEFAULT_EMOTION_STATE.arousal &&
+    state.socialNeed === DEFAULT_EMOTION_STATE.socialNeed
   );
 }
 
@@ -87,6 +115,11 @@ function isSnapshot(data: unknown): data is ProactiveChatSnapshot {
 export interface ProactiveChatPluginOptions {
   /** Injectable clock (ms since epoch). Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Warning sink for config fields silently replaced by defaults. Defaults to
+   * the shared `console.warn`-based {@link ConfigWarnHandler}.
+   */
+  onWarn?: ConfigWarnHandler;
 }
 
 /**
@@ -113,9 +146,11 @@ export class ProactiveChatPlugin implements Plugin {
   #stopped = false;
   readonly #sends = new Map<string, number[]>();
   readonly #nowFn: () => number;
+  readonly #onWarn: ConfigWarnHandler | undefined;
 
   constructor(options: ProactiveChatPluginOptions = {}) {
     this.#nowFn = options.now ?? (() => Date.now());
+    this.#onWarn = options.onWarn;
   }
 
   /** PluginContext captured at init; `undefined` before init / after teardown. */
@@ -148,7 +183,16 @@ export class ProactiveChatPlugin implements Plugin {
     this.#ctx = ctx;
     this.#storage = ctx.storage;
     this.#heartbeatTicks = 0;
-    const config = resolveProactiveChatConfig(ctx.config['proactiveChat']);
+    // Re-init must not leak state from a previous lifecycle: stale send
+    // timestamps would otherwise survive teardown→init when the snapshot lacks
+    // the session, and a live subscription would double-apply message coupling.
+    this.#sends.clear();
+    this.#unsubscribeMessage?.();
+    this.#unsubscribeMessage = undefined;
+    const config = resolveProactiveChatConfig(
+      ctx.config['proactiveChat'],
+      this.#onWarn ? { onWarn: this.#onWarn } : {},
+    );
     this.#config = config;
     const dynamics: EmotionDynamicsConfig = {
       decayRatePerHour: config.emotion.decayRatePerHour,
@@ -271,7 +315,12 @@ export class ProactiveChatPlugin implements Plugin {
       const assessed = await this.#assessEmotion(ctx, session, emotion, now);
       if (this.#stopped) return;
       if (assessed) {
-        emotion = mergeEmotionAssessment(emotion, assessed);
+        // The user may have messaged while the assessment was in flight, and
+        // the message handler couples the *current* stored state. Re-read it so
+        // the merge builds on that fresh state instead of the stale pre-await
+        // snapshot, which would otherwise clobber the coupling.
+        const current = emotionStore.get(session.id);
+        emotion = mergeEmotionAssessment(current, assessed);
         emotionStore.set(session.id, emotion);
       }
     }
@@ -438,9 +487,13 @@ export class ProactiveChatPlugin implements Plugin {
       const entry = raw as Record<string, unknown>;
 
       const savedEmotion = entry['emotion'];
-      if (isEmotionState(savedEmotion)) {
-        store.set(sessionId, evolveEmotion(savedEmotion, elapsed, dynamics));
-      }
+      // Out-of-range/tampered values are rejected by `isEmotionState` and fall
+      // back to the pristine default; `clampEmotionState` guards the (currently
+      // unreachable) in-range-but-unclamped case as defense in depth.
+      const emotion = isEmotionState(savedEmotion)
+        ? clampEmotionState(savedEmotion)
+        : DEFAULT_EMOTION_STATE;
+      store.set(sessionId, evolveEmotion(emotion, elapsed, dynamics));
 
       const savedSends = entry['sends'];
       if (Array.isArray(savedSends)) {
@@ -463,10 +516,18 @@ export class ProactiveChatPlugin implements Plugin {
     const store = this.#emotionStore;
     const queue = this.#queue;
     const config = this.#config;
+    const ctx = this.#ctx;
     if (!storage || !store || !queue || !config || !config.persistence.enabled) return;
 
     try {
+      // One clock read drives both the per-session `get()`s and `savedAt`, so a
+      // restore evolves from an exactly-consistent baseline.
       const now = this.#nowFn();
+      // Prune to sessions that still exist: sessions removed at runtime, or not
+      // re-created after a restart (fresh UUIDs), must not be re-persisted.
+      const liveIds = ctx
+        ? new Set(ctx.sessions.list().map((session) => session.id))
+        : undefined;
       const sessions: Record<string, ProactivePersistedSession> = {};
       const ids = new Set<string>([
         ...store.sessions(),
@@ -474,11 +535,15 @@ export class ProactiveChatPlugin implements Plugin {
         ...queue.sessions(),
       ]);
       for (const sessionId of ids) {
+        if (liveIds && !liveIds.has(sessionId)) continue;
         // `get` (not `peek`) evolves the stored state to `now` so the snapshot
         // and its `savedAt` stamp stay consistent for restore.
-        const emotion = store.get(sessionId);
+        const emotion = store.get(sessionId, now);
         const sends = (this.#sends.get(sessionId) ?? []).filter((at) => now - at < ONE_DAY_MS);
         const held = [...queue.entries(sessionId)];
+        // Drop entries that carry no signal: a pristine-default emotion with no
+        // sends and no held stubs is indistinguishable from a fresh session.
+        if (held.length === 0 && sends.length === 0 && isDefaultEmotion(emotion)) continue;
         sessions[sessionId] = { emotion, sends, queue: held };
       }
 

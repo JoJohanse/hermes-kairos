@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,7 @@ import { decide } from './decision.js';
 import {
   applyUserMessageCoupling,
   DEFAULT_EMOTION_DYNAMICS,
+  DEFAULT_EMOTION_STATE,
   evolveEmotion,
 } from './emotion.js';
 import { ProactiveChatPlugin, PROACTIVE_CHAT_STATE_NAME } from './index.js';
@@ -246,6 +247,20 @@ function writeSnapshot(fs: MemoryFs, snapshot: ProactiveChatSnapshot): void {
     join('data', `${PROACTIVE_CHAT_STATE_NAME}.json`),
     JSON.stringify(snapshot),
   );
+}
+
+/** Read back the snapshot the plugin wrote to an injected {@link MemoryFs}. */
+function readMemorySnapshot(fs: MemoryFs): ProactiveChatSnapshot {
+  const raw = fs.files.get(join('data', `${PROACTIVE_CHAT_STATE_NAME}.json`));
+  if (raw === undefined) throw new Error('snapshot was not written');
+  return JSON.parse(raw) as ProactiveChatSnapshot;
+}
+
+/** Read back the snapshot the plugin wrote to a real data dir. */
+function readSnapshotFrom(dataDir: string): ProactiveChatSnapshot {
+  return JSON.parse(
+    readFileSync(join(dataDir, `${PROACTIVE_CHAT_STATE_NAME}.json`), 'utf8'),
+  ) as ProactiveChatSnapshot;
 }
 
 function heldStub(sessionId: string, enqueuedAt: number, score: number): HeldStub {
@@ -522,6 +537,47 @@ describe('ProactiveChatPlugin (integration)', () => {
     expect(session.messages.filter((message) => message.role === 'agent')).toHaveLength(0);
   });
 
+  it('merges an in-flight assessment into a state coupled by a concurrent message', async () => {
+    vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+    const provider = new DeferredProvider();
+    const { runtime, plugin } = await boot({
+      slice: pluginSlice({
+        emotion: {
+          decayRatePerHour: 0.1,
+          socialNeedGrowthPerHour: 0.2,
+          arousalFloor: 0.2,
+          useLlmAssessment: true,
+        },
+      }),
+      provider,
+    });
+
+    const session = runtime.sessions.create();
+    runtime.sessions.appendMessage(session.id, 'user', 'hello');
+
+    // Start a heartbeat whose assessment call stays pending.
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(provider.requests).toHaveLength(1);
+
+    // A user message arrives while the assessment is in flight and couples the
+    // *current* state (arousal bumped, socialNeed reset).
+    runtime.sessions.appendMessage(session.id, 'user', 'still here');
+    const coupled = plugin.emotionState(session.id);
+    expect(coupled?.arousal).toBeGreaterThan(0.85);
+    expect(coupled?.socialNeed).toBeCloseTo(0.1);
+
+    provider.resolve('{"valence":0.9,"arousal":1,"socialNeed":0.9}');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The merge must build on the coupled state, not the stale pre-await one.
+    const merged = plugin.emotionState(session.id);
+    expect(merged?.arousal).toBeGreaterThan(0.9);
+    expect(merged?.socialNeed).toBeLessThan(0.65);
+
+    await runtime.stop();
+  });
+
   describe('user-message coupling (F7)', () => {
     it('raises arousal and resets socialNeed on a user message', async () => {
       vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
@@ -575,6 +631,62 @@ describe('ProactiveChatPlugin (integration)', () => {
       expect(plugin.emotionState('ghost')).toBeUndefined();
     });
 
+    it('re-init unsubscribes the old handler so coupling is not applied twice', () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const bus = new RecordingBus();
+      const { ctx } = makePluginContext({
+        bus,
+        slice: pluginSlice({
+          emotion: {
+            decayRatePerHour: 0.1,
+            socialNeedGrowthPerHour: 0.2,
+            arousalFloor: 0.2,
+            useLlmAssessment: false,
+            userMessageArousalBump: 0.1,
+            interactionSocialNeedReset: 0.1,
+          },
+          persistence: { enabled: false },
+        }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      plugin.init(ctx);
+
+      // The second init must drop the first subscription before re-subscribing.
+      expect(bus.unsubscribeCalls).toBe(1);
+
+      const session = ctx.sessions.create();
+      ctx.sessions.appendMessage(session.id, 'user', 'hi');
+
+      // Default arousal 0.8 + a single 0.1 bump = 0.9 (a double bump would be 1).
+      const state = plugin.emotionState(session.id);
+      expect(state?.arousal).toBeCloseTo(0.9, 10);
+      expect(state?.socialNeed).toBe(0.1);
+      expect(state?.valence).toBe(0.7);
+    });
+
+    it('re-init clears stale send cooldown state', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 5, 0, 0));
+      const { ctx, scheduler, sessions } = makePluginContext({
+        slice: pluginSlice({ persistence: { enabled: false } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      scheduler.start();
+      const session = sessions.create();
+      sessions.appendMessage(session.id, 'user', 'hi');
+
+      vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(1);
+
+      plugin.init(ctx);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(0);
+
+      plugin.teardown();
+      scheduler.stop();
+    });
+
     it('lowers the proactive score, all else equal, after a user interaction', () => {
       const emotion: EmotionState = { valence: 0.7, arousal: 0.8, socialNeed: 0.5 };
       const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
@@ -622,6 +734,114 @@ describe('ProactiveChatPlugin (integration)', () => {
       expect(second.plugin.emotionState(session.id)).toEqual(savedEmotion);
       expect([...second.plugin.sendTimestamps(session.id)]).toEqual(savedSends);
       await second.runtime.stop();
+
+      // The session was never re-created in the second runtime (fresh UUIDs), so
+      // pruning at save time must drop it instead of re-persisting it forever.
+      const persisted = readSnapshotFrom(dataDir);
+      expect(Object.keys(persisted.sessions)).not.toContain(session.id);
+    });
+
+    it('drops a session removed at runtime from the next snapshot', () => {
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      vi.setSystemTime(now);
+      const fs = new MemoryFs();
+      const { ctx, sessions } = makePluginContext({ fs, slice: pluginSlice() });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      const kept = sessions.create();
+      const removed = sessions.create();
+      sessions.appendMessage(kept.id, 'user', 'hi');
+      sessions.appendMessage(removed.id, 'user', 'hi');
+
+      // First save persists both live sessions.
+      plugin.teardown();
+      expect(Object.keys(readMemorySnapshot(fs).sessions).sort()).toEqual(
+        [kept.id, removed.id].sort(),
+      );
+
+      // Re-init restores both from the snapshot, but the removed session is no
+      // longer live, so the next save must not re-persist it.
+      sessions.remove(removed.id);
+      plugin.init(ctx);
+      plugin.teardown();
+      expect(Object.keys(readMemorySnapshot(fs).sessions)).toEqual([kept.id]);
+    });
+
+    it('periodically saves every saveIntervalTicks heartbeats', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 5, 0, 0));
+      const fs = new MemoryFs();
+      const { ctx, scheduler, sessions } = makePluginContext({
+        fs,
+        slice: pluginSlice({ persistence: { enabled: true, saveIntervalTicks: 2 } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      scheduler.start();
+      const session = sessions.create();
+      sessions.appendMessage(session.id, 'user', 'hi');
+      expect(fs.writeCount).toBe(0);
+
+      // Tick 1: below the interval, no periodic save.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fs.writeCount).toBe(0);
+
+      // Tick 2: the interval elapses exactly once.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fs.writeCount).toBe(1);
+
+      // Tick 3: no save (and no double-count from the previous tick).
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fs.writeCount).toBe(1);
+
+      // Tick 4: saves again.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fs.writeCount).toBe(2);
+
+      plugin.teardown();
+      scheduler.stop();
+    });
+
+    it('rejects out-of-range emotion in a snapshot and restores the default', () => {
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      vi.setSystemTime(now);
+      const fs = new MemoryFs();
+      writeSnapshot(fs, {
+        version: PROACTIVE_CHAT_SNAPSHOT_VERSION,
+        savedAt: now,
+        sessions: {
+          bad: {
+            emotion: { valence: 42, arousal: -5, socialNeed: 2 },
+            sends: [],
+            queue: [],
+          },
+        },
+      });
+
+      const { ctx } = makePluginContext({ fs });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+
+      expect(plugin.emotionState('bad')).toEqual(DEFAULT_EMOTION_STATE);
+      plugin.teardown();
+    });
+
+    it('restores valid in-range emotion unchanged', () => {
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      vi.setSystemTime(now);
+      const fs = new MemoryFs();
+      const emotion: EmotionState = { valence: 0.2, arousal: 0.3, socialNeed: 0.4 };
+      writeSnapshot(fs, {
+        version: PROACTIVE_CHAT_SNAPSHOT_VERSION,
+        savedAt: now,
+        sessions: { good: { emotion, sends: [], queue: [] } },
+      });
+
+      const { ctx } = makePluginContext({ fs });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+
+      expect(plugin.emotionState('good')).toEqual(emotion);
+      plugin.teardown();
     });
 
     it('evolves restored emotion forward by the wall-clock gap', async () => {

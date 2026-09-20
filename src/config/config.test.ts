@@ -242,6 +242,27 @@ describe('resolveProactiveChatConfig', () => {
     ]);
   });
 
+  it('warns about wrong-typed enabled/persistence/persona fields and uses defaults', () => {
+    const { warnings, onWarn } = collector();
+    const resolved = resolveProactiveChatConfig(
+      {
+        enabled: 'yes',
+        persistence: { enabled: 1 },
+        persona: { systemPrompt: 42 },
+      },
+      { onWarn },
+    );
+
+    expect(resolved.enabled).toBe(true);
+    expect(resolved.persistence.enabled).toBe(true);
+    expect(resolved.persona.systemPrompt).toBe(DEFAULT_PERSONA_SYSTEM_PROMPT);
+    expect(warnings.map((warning) => warning.field)).toEqual([
+      'enabled',
+      'persistence.enabled',
+      'persona.systemPrompt',
+    ]);
+  });
+
   it('emits no warnings for a fully valid config', () => {
     const { warnings, onWarn } = collector();
     const resolved = resolveProactiveChatConfig(
@@ -357,6 +378,20 @@ describe('loadConfig', () => {
     const config = loadConfig({ configPath: path, env: {}, onWarn });
     expect(config.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(warnings.map((warning) => warning.field)).toEqual(['llm.requestTimeoutMs']);
+  });
+
+  it('warns when file sections are present but not objects', () => {
+    const path = tempConfigPath(JSON.stringify({ plugins: 5, llm: 'x', storage: [] }));
+    const { warnings, onWarn } = collector();
+    const config = loadConfig({ configPath: path, env: {}, onWarn });
+
+    expect(warnings.map((warning) => warning.field)).toEqual(['plugins', 'llm', 'storage']);
+    expect(warnings.every((warning) => warning.reason === 'not an object; section ignored')).toBe(
+      true,
+    );
+    // The malformed sections are ignored wholesale; defaults still apply.
+    expect(config.storage.dataDir).toBe(DEFAULT_STORAGE_DATA_DIR);
+    expect(config.plugins.proactiveChat.decision.sendThreshold).toBe(0.6);
   });
 
   it('does not emit spurious deprecated warnings for the default slice', () => {

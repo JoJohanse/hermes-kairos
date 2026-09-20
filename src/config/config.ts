@@ -401,6 +401,10 @@ export function resolveProactiveChatConfig(
       reason: 'deprecated and unsupported; ignored',
     });
   }
+  const enabled = booleanFrom(root, 'enabled', defaults.enabled);
+  if (root['enabled'] !== undefined && typeof root['enabled'] !== 'boolean') {
+    warn({ field: 'enabled', value: root['enabled'], reason: 'expected a boolean; using default' });
+  }
   const heartbeat = asObject(root['heartbeat']);
   const decision = asObject(root['decision']);
   const emotion = asObject(root['emotion']);
@@ -494,8 +498,25 @@ export function resolveProactiveChatConfig(
     });
   }
 
+  const persistenceEnabled = booleanFrom(persistence, 'enabled', defaults.persistence.enabled);
+  if (persistence['enabled'] !== undefined && typeof persistence['enabled'] !== 'boolean') {
+    warn({
+      field: 'persistence.enabled',
+      value: persistence['enabled'],
+      reason: 'expected a boolean; using default',
+    });
+  }
+  const personaSystemPrompt = stringFrom(persona, 'systemPrompt', defaults.persona.systemPrompt);
+  if (persona['systemPrompt'] !== undefined && typeof persona['systemPrompt'] !== 'string') {
+    warn({
+      field: 'persona.systemPrompt',
+      value: persona['systemPrompt'],
+      reason: 'expected a string; using default',
+    });
+  }
+
   return {
-    enabled: booleanFrom(root, 'enabled', defaults.enabled),
+    enabled,
     heartbeat: { intervalMs },
     decision: {
       sendThreshold,
@@ -586,10 +607,10 @@ export function resolveProactiveChatConfig(
       ),
     },
     persona: {
-      systemPrompt: stringFrom(persona, 'systemPrompt', defaults.persona.systemPrompt),
+      systemPrompt: personaSystemPrompt,
     },
     persistence: {
-      enabled: booleanFrom(persistence, 'enabled', defaults.persistence.enabled),
+      enabled: persistenceEnabled,
       saveIntervalTicks: numberField(
         persistence,
         'saveIntervalTicks',
@@ -642,6 +663,16 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
   }
   if (!isPlainObject(parsed)) {
     throw new Error(`loadConfig: ${configPath} must contain a JSON object`);
+  }
+
+  // Sections the loader expects to be objects: a wrong-typed section is ignored
+  // wholesale (deep-merge would otherwise treat it as a scalar override), so
+  // surface it rather than silently dropping it.
+  for (const section of ['plugins', 'llm', 'storage'] as const) {
+    const value = parsed[section];
+    if (value !== undefined && !isPlainObject(value)) {
+      warn({ field: section, value, reason: 'not an object; section ignored' });
+    }
   }
 
   const merged = deepMerge(

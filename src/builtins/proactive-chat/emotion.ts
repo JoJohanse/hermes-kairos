@@ -183,9 +183,13 @@ export class EmotionStore {
     return [...this.#states.keys()];
   }
 
-  /** Evolve the session state to `now()` and return a copy. */
-  get(sessionId: string): EmotionState {
-    const now = this.#now();
+  /**
+   * Evolve the session state to `atMs` (defaults to `now()`) and return a copy.
+   * Passing an explicit `atMs` lets callers evolve several sessions to one
+   * shared clock read.
+   */
+  get(sessionId: string, atMs?: number): EmotionState {
+    const now = atMs ?? this.#now();
     const entry = this.#states.get(sessionId);
     if (!entry) {
       const state = { ...this.#initial };

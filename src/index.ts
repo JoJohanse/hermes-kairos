@@ -1,4 +1,4 @@
-import { loadConfig } from './config/config.js';
+import { defaultConfigWarn, loadConfig, type ConfigWarnHandler } from './config/config.js';
 import { createProactiveChatPlugin } from './builtins/proactive-chat/index.js';
 import { HermesRuntime } from './core/runtime.js';
 import { OpenAICompatibleProvider } from './llm/openai-compatible.js';
@@ -10,7 +10,10 @@ import { OpenAICompatibleProvider } from './llm/openai-compatible.js';
  * runtime, and installs a graceful shutdown handler.
  */
 async function main(): Promise<void> {
-  const config = loadConfig();
+  // One warning sink shared by config loading and plugin config resolution, so
+  // hosts collecting config warnings do not also get stray console.warn lines.
+  const onWarn: ConfigWarnHandler = defaultConfigWarn;
+  const config = loadConfig({ onWarn });
   const llm = new OpenAICompatibleProvider({
     baseURL: config.llm.baseURL,
     apiKey: config.llm.apiKey,
@@ -19,7 +22,7 @@ async function main(): Promise<void> {
   });
 
   const runtime = new HermesRuntime({ config, llm });
-  runtime.register(createProactiveChatPlugin());
+  runtime.register(createProactiveChatPlugin({ onWarn }));
 
   await runtime.start();
   console.log('hermes-kairos runtime started');
