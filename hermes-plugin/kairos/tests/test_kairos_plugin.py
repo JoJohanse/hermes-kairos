@@ -940,5 +940,76 @@ def test_register_send_without_target_is_noop(monkeypatch):
     assert called["run"] is False
 
 
+# ---------------------------------------------------------------------------
+# single-owner guard (multi-process hosts)
+# ---------------------------------------------------------------------------
+
+
+def test_owner_slot_blocks_a_second_live_process(tmp_path):
+    """A second live hermes process must NOT claim the slot (it would kill the owner's sidecar)."""
+    data_dir = str(tmp_path)
+    assert bridge.acquire_owner_slot(data_dir) is True
+    # Simulate a different live process holding the marker: our own pid is alive, and
+    # _pid_alive is injected through the module-level helper the claim consults.
+    original = bridge._pid_alive
+    try:
+        bridge._pid_alive = lambda pid: True
+        os_pid = os.getpid()
+        with open(bridge.owner_pidfile_path(data_dir), "w", encoding="utf-8") as handle:
+            handle.write(str(os_pid + 1))
+        assert bridge.acquire_owner_slot(data_dir) is False
+    finally:
+        bridge._pid_alive = original
+        bridge.release_owner_slot(data_dir)
+
+
+def test_owner_slot_takes_over_a_dead_process(tmp_path):
+    """A stale marker whose process is gone is replaced, not honored forever."""
+    data_dir = str(tmp_path)
+    with open(bridge.owner_pidfile_path(data_dir), "w", encoding="utf-8") as handle:
+        handle.write("2147483000")  # implausible pid, never alive
+    assert bridge.acquire_owner_slot(data_dir) is True
+    with open(bridge.owner_pidfile_path(data_dir), "r", encoding="utf-8") as handle:
+        assert handle.read().strip() == str(os.getpid())
+    bridge.release_owner_slot(data_dir)
+
+
+def test_release_owner_slot_is_idempotent_and_scoped(tmp_path):
+    data_dir = str(tmp_path)
+    bridge.release_owner_slot(data_dir)  # no marker: must not raise
+    assert bridge.acquire_owner_slot(data_dir) is True
+    bridge.release_owner_slot(data_dir)
+    assert not os.path.exists(bridge.owner_pidfile_path(data_dir))
+    # A marker owned by another pid must survive our release.
+    with open(bridge.owner_pidfile_path(data_dir), "w", encoding="utf-8") as handle:
+        handle.write("2147483000")
+    bridge.release_owner_slot(data_dir)
+    assert os.path.exists(bridge.owner_pidfile_path(data_dir))
+
+
+def test_register_is_inert_when_another_owner_is_live(tmp_path, monkeypatch):
+    """The second process spawns no sidecar and opens no callback listener."""
+    monkeypatch.setattr(bridge, "_pid_alive", lambda pid: True)
+    data_dir = str(tmp_path)
+    with open(bridge.owner_pidfile_path(data_dir), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid() + 1))
+    ctx = MockCtx(_register_config({"dataDir": data_dir}))
+    procs = []
+    logs = []
+    result = bridge.register(
+        ctx,
+        popen_factory=lambda *a, **k: procs.append(FakeProc()) or procs[-1],
+        health_probe=lambda: True,
+        log=logs.append,
+        sidecar_kwargs={"is_windows": False, "sleep": lambda _s: None},
+    )
+    assert result["owner"] is False
+    assert result["sidecar"] is None and result["server"] is None
+    assert procs == [], "a non-owner must never spawn a sidecar"
+    assert ctx.hooks == {}, "a non-owner must not register hooks"
+    assert any("owns the kairos stack" in line for line in logs)
+    result["teardown"]()  # must be a harmless no-op
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

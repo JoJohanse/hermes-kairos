@@ -71,6 +71,7 @@ injection fails the plugin logs the concrete reason chain instead of guessing.
 
 from __future__ import annotations
 
+import atexit
 import hmac
 import http.server
 import json
@@ -121,6 +122,10 @@ __all__ = [
     "DEFAULT_CALLBACK_PORT",
     "DEFAULT_START_TIMEOUT_SEC",
     "DEFAULT_DATA_DIR_NAME",
+    "OWNER_PIDFILE_NAME",
+    "owner_pidfile_path",
+    "acquire_owner_slot",
+    "release_owner_slot",
     "HEALTH_ROUTE",
     "SPEAK_ROUTE",
     "EVENTS_ROUTE",
@@ -145,6 +150,10 @@ HEALTH_ROUTE = "/health"
 SPEAK_ROUTE = "/speak"
 EVENTS_ROUTE = "/events"
 PIDFILE_NAME = "sidecar.pid"
+# Single-owner marker: names the hermes process that owns the kairos stack (see
+# acquire_owner_slot). The sidecar port and the callback port are single-bind, so
+# exactly one process per host may run the stack.
+OWNER_PIDFILE_NAME = "owner.pid"
 
 REQUIRED_CONTENT_TYPE = "application/json"
 STATUS_UNSUPPORTED_MEDIA_TYPE = 415
@@ -247,6 +256,88 @@ def ensure_data_dir(path: str, log: Optional[LogFn] = None) -> str:
     except Exception as exc:
         _resolve_log(log)(f"could not create dataDir {path!r}: {exc} (continuing)")
     return path
+
+
+def owner_pidfile_path(data_dir: str) -> str:
+    """Path of the single-owner marker for *data_dir*."""
+    return os.path.join(data_dir, OWNER_PIDFILE_NAME)
+
+
+def _read_owner_pid(path: str) -> Optional[int]:
+    """Pid recorded in an owner pidfile (``None`` when absent, unreadable or malformed)."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except Exception:
+        return None
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def acquire_owner_slot(data_dir: str, log: Optional[LogFn] = None) -> bool:
+    """Claim the single-owner slot for the kairos stack; True when THIS process owns it.
+
+    The sidecar port and the callback port are single-bind, so exactly one hermes
+    process per host may run the stack. Without this guard every transient ``hermes``
+    command (``gateway status``, ``plugins list``, a one-shot chat, ...) would spawn a
+    competing sidecar, and its EADDRINUSE recovery would kill the live owner's sidecar
+    and then orphan its own.
+
+    The marker is created with ``O_EXCL`` (atomic); an existing marker is taken over
+    only when its recorded process is gone, so a live owner is never dislodged.
+    """
+    logger = _resolve_log(log)
+    path = owner_pidfile_path(data_dir)
+    me = os.getpid()
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception as exc:
+        logger(f"could not create dataDir {data_dir!r}: {exc} (continuing as owner)")
+        return True
+
+    try:
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # A marker exists. Never dislodge a live owner; take over only a dead one.
+        current = _read_owner_pid(path)
+        if current is not None and current != me and _pid_alive(current):
+            return False
+        try:
+            with open(path, "w", encoding="utf-8") as existing_handle:
+                existing_handle.write(str(me))
+        except Exception as exc:
+            logger(f"could not claim owner pidfile {path!r}: {exc} (continuing as owner)")
+            return True
+        confirmed = _read_owner_pid(path)
+        return not (confirmed is not None and confirmed != me)
+    except Exception as exc:
+        logger(f"could not create owner pidfile {path!r}: {exc} (continuing as owner)")
+        return True
+
+    try:
+        os.write(handle, str(me).encode("utf-8"))
+    except Exception as exc:
+        logger(f"could not write owner pidfile {path!r}: {exc} (continuing as owner)")
+    finally:
+        try:
+            os.close(handle)
+        except Exception:
+            pass
+    return True
+
+
+def release_owner_slot(data_dir: str) -> None:
+    """Drop the owner pidfile when it still names this process (best effort)."""
+    path = owner_pidfile_path(data_dir)
+    if _read_owner_pid(path) != os.getpid():
+        return
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
 
 def _cfg(ctx: Any, key: str, default: Any) -> Any:
@@ -1525,6 +1616,26 @@ def register(
             '(set settings.token to "none" to explicitly disable auth)'
         )
 
+    # Single-owner guard (see acquire_owner_slot): the sidecar port and the callback
+    # port are single-bind, so a second process must NOT spawn a competing sidecar —
+    # its EADDRINUSE recovery would kill the live owner's sidecar and orphan its own.
+    if not acquire_owner_slot(data_dir, logger):
+        logger(
+            f"another live hermes process owns the kairos stack (sidecar port {settings.port}); "
+            f"pid {os.getpid()} stays inert (no sidecar, no callback listener)"
+        )
+        return {
+            "sidecar": None,
+            "server": None,
+            "forwarder": None,
+            "settings": settings,
+            "nonce": nonce,
+            "argv": [],
+            "hooks_ok": False,
+            "owner": False,
+            "teardown": lambda: None,
+        }
+
     argv = build_sidecar_argv(settings, nonce)
     child_env = dict(os.environ)
     hermes_home = str(environ.get("HERMES_HOME") or "").strip()
@@ -1586,11 +1697,22 @@ def register(
             sidecar.stop()
         except Exception as exc:
             logger(f"sidecar shutdown error: {exc}")
+        try:
+            release_owner_slot(data_dir)
+        except Exception as exc:
+            logger(f"owner slot release failed (ignored): {exc}")
 
     try:
         ctx.on_unload(teardown)
     except Exception as exc:
         logger(f"on_unload registration failed (ignored): {exc}")
+
+    # A one-shot CLI process exits without hermes calling on_unload; releasing the
+    # owner slot at interpreter exit keeps the next process from seeing a stale owner.
+    try:
+        atexit.register(teardown)
+    except Exception as exc:
+        logger(f"atexit registration failed (ignored): {exc}")
 
     logger("kairos plugin ready")
     return {
@@ -1601,5 +1723,6 @@ def register(
         "nonce": nonce,
         "argv": argv,
         "hooks_ok": hooks_ok,
+        "owner": True,
         "teardown": teardown,
     }
