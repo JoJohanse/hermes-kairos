@@ -156,6 +156,15 @@ node <plugin_dir>/../../dist/hermes-bridge/main.js \
 | No events reach the sidecar | Check the `[kairos] event forward failed` logs. Events are 2s-timeout best-effort and intentionally dropped rather than blocking a hook. |
 | Injection weirdness after config change | Unload/reload plugins (`hermes plugins disable kairos && hermes plugins enable kairos`); `on_unload` terminates the sidecar (SIGTERM, then SIGKILL after 5s) and shuts the listener down. |
 
+## Gateway routing note
+
+`inject_message` returning `True` means the gateway **accepted** the injection;
+it is only routed into an agent turn when the target session already exists
+(i.e. the user has chatted before on that platform/channel). Reaching out to a
+never-seen session logs `Plugin message injection was not routed` — expected.
+A user-visible delivery therefore requires: a configured platform session,
+`allow_gateway_injection: true`, and a working LLM key for the follow-up turn.
+
 ## Layout
 
 ```

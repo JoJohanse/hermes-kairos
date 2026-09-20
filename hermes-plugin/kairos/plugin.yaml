@@ -3,7 +3,7 @@ version: "0.1.0"
 description: "Proactive conversation engine (KAIROS): decides when the agent should reach out first; bridges hermes to the kairos sidecar."
 author: "hermes-kairos"
 license: "MIT"
-hooks:
+provides_hooks:
   - on_session_start
   - on_session_end
   - pre_llm_call
