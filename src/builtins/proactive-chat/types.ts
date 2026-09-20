@@ -115,6 +115,18 @@ export interface ProactiveEmotionConfig {
   arousalFloor: number;
   /** When true, a single LLM assessment call is merged into the evolved state. */
   useLlmAssessment: boolean;
+  /** `arousal` boost applied when the user messages the agent. */
+  userMessageArousalBump: number;
+  /** `socialNeed` is capped to this value when the user messages the agent. */
+  interactionSocialNeedReset: number;
+}
+
+/** Plugin-state persistence configuration. */
+export interface ProactivePersistenceConfig {
+  /** When false, plugin state is neither loaded nor saved. */
+  enabled: boolean;
+  /** Heartbeats between periodic saves (in addition to teardown/deliver saves). */
+  saveIntervalTicks: number;
 }
 
 /** Context-bundle configuration. */
@@ -147,6 +159,7 @@ export interface ProactiveChatResolvedConfig {
   context: ProactiveContextConfig;
   delayedQueue: ProactiveDelayedQueueConfig;
   persona: ProactivePersonaConfig;
+  persistence: ProactivePersistenceConfig;
 }
 
 /** Payload for the `proactive:thought` event (emitted when a thought is sent). */
@@ -178,4 +191,31 @@ export interface ProactiveHeldEvent {
 export interface ProactiveSkippedEvent {
   sessionId: string;
   reason: string;
+}
+
+/** Current schema version for {@link ProactiveChatSnapshot}. */
+export const PROACTIVE_CHAT_SNAPSHOT_VERSION = 1;
+
+/** Persisted per-session plugin state. */
+export interface ProactivePersistedSession {
+  /** Emotion state as stored (not yet evolved to reload time). */
+  emotion: EmotionState;
+  /** Proactive send timestamps (ms since epoch). */
+  sends: number[];
+  /** Held HOLD-band stubs. */
+  queue: HeldStub[];
+}
+
+/**
+ * On-disk snapshot of all proactive-chat per-session state.
+ *
+ * Written by `JsonStore` under `<dataDir>/proactive-chat.json`. On restore the
+ * plugin prunes time-sensitive entries and evolves emotions forward by the
+ * wall-clock gap since `savedAt`.
+ */
+export interface ProactiveChatSnapshot {
+  version: typeof PROACTIVE_CHAT_SNAPSHOT_VERSION;
+  /** Wall-clock time the snapshot was taken (ms since epoch). */
+  savedAt: number;
+  sessions: Record<string, ProactivePersistedSession>;
 }

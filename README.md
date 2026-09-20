@@ -14,6 +14,7 @@ hermes-kairos/
 │   │   ├── types.ts                 # Message, Session, MessageRole
 │   │   ├── event-bus.ts             # typed pub/sub (on/once/off/emit/clear)
 │   │   ├── session-manager.ts       # in-memory sessions + message history + idle tracking
+│   │   ├── storage.ts               # JsonStore: atomic, injectable-fs JSON file store
 │   │   └── runtime.ts               # HermesRuntime: wires bus, sessions, scheduler, llm, plugins
 │   ├── llm/
 │   │   ├── types.ts                 # LLMProvider / CompletionRequest / CompletionResult
@@ -43,12 +44,12 @@ hermes-kairos/
 ### Lifecycle
 
 1. `loadConfig()` resolves LLM settings from env (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`) and merges an optional `hermes.config.json` at the repo root.
-2. `new HermesRuntime({ config, llm })` creates the event bus, session manager, scheduler and plugin registry.
+2. `new HermesRuntime({ config, llm })` creates the event bus, session manager (wired to the bus for `message:appended`), scheduler, `JsonStore` and plugin registry.
 3. `runtime.register(plugin)` adds plugins (the built-in proactive-chat plugin is registered by the bootstrap).
 4. `runtime.start()` starts the scheduler, then runs `init(ctx)` for each plugin in order; a throwing plugin is logged and skipped without blocking the rest.
 5. `runtime.stop()` tears plugins down in reverse order and stops the scheduler.
 
-`PluginContext.send(sessionId, content)` is the only sanctioned way for a plugin to speak: it appends an `agent`-role message and emits `message:outbound` on the bus.
+`PluginContext.send(sessionId, content)` is the only sanctioned way for a plugin to speak: it appends an `agent`-role message and emits `message:outbound` on the bus. Every message appended through the session store (any role) also emits `message:appended`, and plugins receive a `PluginContext.storage` (`JsonStore`) for durable JSON state under `storage.dataDir`.
 
 ## Requirements
 
@@ -86,6 +87,9 @@ Environment variables:
 | `LLM_API_KEY` | *(empty)* | Bearer token |
 | `LLM_MODEL` | `gpt-4o-mini` | Model id |
 
+`storage.dataDir` (default `.hermes-data`) is where plugins persist JSON state;
+it is created lazily on first write and is git-ignored.
+
 Optional `hermes.config.json` at the repo root overrides any of the above and the
 plugin defaults, e.g.:
 
@@ -101,7 +105,10 @@ plugin defaults, e.g.:
 }
 ```
 
-Runtime state is intentionally in-memory: sessions/messages, per-session emotion,
-the HOLD stub queue and send counters all reset on restart. See
+Sessions/messages remain in-memory in the kernel (persistence is a deployment
+concern). The proactive-chat plugin, however, snapshots its own per-session
+state (emotion, HOLD stubs, send timestamps) to `storage.dataDir`, so it
+survives restarts. See
 [`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md)
-for the full plugin behavior and configuration reference.
+for the full plugin behavior, persistence semantics and configuration
+reference.

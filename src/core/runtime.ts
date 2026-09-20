@@ -1,6 +1,9 @@
+import { DEFAULT_STORAGE_DATA_DIR } from '../config/config.js';
 import type { EventMap } from '../core/event-bus.js';
 import { EventBus } from '../core/event-bus.js';
 import { SessionManager } from '../core/session-manager.js';
+import { JsonStore } from '../core/storage.js';
+import type { Message } from '../core/types.js';
 import type { LLMProvider } from '../llm/types.js';
 import { PluginRegistry } from '../plugins/registry.js';
 import { Scheduler } from '../scheduler/scheduler.js';
@@ -14,6 +17,8 @@ export interface KernelEvents extends EventMap {
   'runtime:started': Record<string, never>;
   /** Emitted after `stop()` finishes shutting everything down. */
   'runtime:stopped': Record<string, never>;
+  /** Emitted for every appended message (any role) once it has been stored. */
+  'message:appended': { message: Message };
   /** Emitted by `PluginContext.send` for every outbound agent message. */
   'message:outbound': { sessionId: string; content: string; timestamp: number };
   /** Emitted when plugin initialization fails. */
@@ -23,6 +28,8 @@ export interface KernelEvents extends EventMap {
 /** Minimal runtime configuration surface required by the kernel. */
 export interface RuntimeConfig {
   llm: { baseURL: string; apiKey: string; model: string };
+  /** Optional storage location for plugin JSON state. */
+  storage?: { dataDir: string };
   plugins: Record<string, unknown>;
 }
 
@@ -46,6 +53,7 @@ export class HermesRuntime {
   readonly scheduler: Scheduler;
   readonly llm: LLMProvider;
   readonly plugins: PluginRegistry;
+  readonly storage: JsonStore;
   readonly config: RuntimeConfig;
 
   #started = false;
@@ -54,8 +62,11 @@ export class HermesRuntime {
   constructor(options: HermesRuntimeOptions) {
     this.config = options.config;
     this.eventBus = options.eventBus ?? new EventBus<KernelEvents>();
-    this.sessions = new SessionManager();
+    this.sessions = new SessionManager({ eventBus: this.eventBus });
     this.scheduler = options.scheduler ?? new Scheduler();
+    this.storage = new JsonStore({
+      dataDir: options.config.storage?.dataDir ?? DEFAULT_STORAGE_DATA_DIR,
+    });
     this.llm = options.llm;
     this.plugins = new PluginRegistry({
       onError: ({ plugin, error }) => {
@@ -94,6 +105,7 @@ export class HermesRuntime {
       sessions: this.sessions,
       scheduler: this.scheduler,
       llm: this.llm,
+      storage: this.storage,
       config: this.config.plugins,
       send: async (sessionId, content) => {
         const message = this.sessions.appendMessage(sessionId, 'agent', content);

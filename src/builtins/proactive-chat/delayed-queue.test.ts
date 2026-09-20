@@ -109,6 +109,23 @@ describe('DelayedQueue', () => {
     expect(queue.entries('s1')[0]?.scoreAtEnqueue).toBeCloseTo(0.1);
   });
 
+  it('restores stubs, pruning expired ones and capping at maxSize', () => {
+    const now = 10 * HOUR;
+    const queue = new DelayedQueue({ maxSize: 2, maxAgeHours: 4, now: () => now });
+
+    queue.restore('s1', [
+      stub('s1', 0.2, now - 1 * HOUR),
+      stub('s1', 0.9, now - 2 * HOUR),
+      stub('s1', 0.5, now - 3 * HOUR),
+      stub('s1', 0.9, now - 10 * HOUR), // expired
+    ]);
+
+    expect(queue.size('s1')).toBe(2);
+    expect(
+      [...queue.entries('s1')].map((entry) => entry.scoreAtEnqueue).sort(),
+    ).toEqual([0.5, 0.9]);
+  });
+
   it('clears one session or all sessions', () => {
     const queue = new DelayedQueue({ now: () => 0 });
     queue.enqueue(stub('s1', 0.4, 0));

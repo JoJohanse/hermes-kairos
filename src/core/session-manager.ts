@@ -1,10 +1,25 @@
 import { randomUUID } from 'node:crypto';
 import type { Message, MessageRole, Session } from './types.js';
 
+/**
+ * Minimal publish surface the session store needs. Structurally satisfied by the
+ * kernel's {@link EventBus}, declared here so this module never imports the
+ * runtime (avoiding a circular dependency).
+ */
+export interface MessageEventEmitter {
+  emit(topic: 'message:appended', payload: { message: Message }): void;
+}
+
 /** Options for {@link SessionManager}. */
 export interface SessionManagerOptions {
   /** Injectable clock (ms since epoch). Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Optional event emitter. When supplied, every appended message (any role)
+   * emits `message:appended` after it has been stored. When omitted the store
+   * behaves exactly as before (no emission).
+   */
+  eventBus?: MessageEventEmitter;
 }
 
 /**
@@ -14,9 +29,11 @@ export interface SessionManagerOptions {
 export class SessionManager {
   readonly #sessions = new Map<string, Session>();
   readonly #now: () => number;
+  readonly #eventBus: MessageEventEmitter | undefined;
 
   constructor(options: SessionManagerOptions = {}) {
     this.#now = options.now ?? (() => Date.now());
+    this.#eventBus = options.eventBus;
   }
 
   /** Create a new session with a generated id. */
@@ -73,6 +90,9 @@ export class SessionManager {
     };
     session.messages.push(message);
     session.lastActivityAt = timestamp;
+    // Observable side effect: emitted only after the message is stored so
+    // subscribers always observe durable state.
+    this.#eventBus?.emit('message:appended', { message });
     return message;
   }
 

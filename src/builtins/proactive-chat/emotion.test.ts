@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyUserMessageCoupling,
   DEFAULT_EMOTION_DYNAMICS,
   DEFAULT_EMOTION_STATE,
   EmotionStore,
@@ -7,6 +8,7 @@ import {
   evolveEmotion,
   mergeEmotionAssessment,
   parseEmotionAssessment,
+  type UserMessageCouplingConfig,
 } from './emotion.js';
 
 const HOUR = 3_600_000;
@@ -72,6 +74,32 @@ describe('evolveEmotion', () => {
   });
 });
 
+describe('applyUserMessageCoupling', () => {
+  const config: UserMessageCouplingConfig = {
+    userMessageArousalBump: 0.3,
+    interactionSocialNeedReset: 0.1,
+  };
+
+  it('raises arousal and caps socialNeed without touching valence', () => {
+    const coupled = applyUserMessageCoupling(
+      { valence: 0.6, arousal: 0.5, socialNeed: 0.9 },
+      config,
+    );
+    expect(coupled.valence).toBe(0.6);
+    expect(coupled.arousal).toBeCloseTo(0.8);
+    expect(coupled.socialNeed).toBe(0.1);
+  });
+
+  it('caps arousal at 1 and never raises socialNeed above its current value', () => {
+    const coupled = applyUserMessageCoupling(
+      { valence: 0.5, arousal: 0.9, socialNeed: 0.05 },
+      config,
+    );
+    expect(coupled.arousal).toBe(1);
+    expect(coupled.socialNeed).toBe(0.05);
+  });
+});
+
 describe('mergeEmotionAssessment', () => {
   it('blends evolved and assessed states with the 0.4 / 0.6 weights', () => {
     const merged = mergeEmotionAssessment(
@@ -126,6 +154,7 @@ describe('EmotionStore', () => {
     store.get('a');
     store.get('b');
     expect(store.size).toBe(2);
+    expect(store.sessions().sort()).toEqual(['a', 'b']);
 
     store.set('a', { valence: 0.1, arousal: 0.2, socialNeed: 0.3 });
     expect(store.peek('a')).toEqual({ valence: 0.1, arousal: 0.2, socialNeed: 0.3 });

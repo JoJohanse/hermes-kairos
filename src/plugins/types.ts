@@ -1,5 +1,6 @@
 import type { EventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
+import type { JsonStore } from '../core/storage.js';
 import type { Message } from '../core/types.js';
 import type { LLMProvider } from '../llm/types.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
@@ -17,6 +18,8 @@ export interface PluginContext {
   scheduler: Scheduler;
   /** Configured LLM provider. */
   llm: LLMProvider;
+  /** JSON-backed store for plugin-owned persistence (see `storage.dataDir`). */
+  storage: JsonStore;
   /**
    * Plugin configurations from the runtime config, keyed by plugin name
    * (e.g. `config.proactiveChat`). Read and validate your own slice defensively.

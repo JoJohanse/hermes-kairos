@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { EventBus } from './event-bus.js';
 import { SessionManager } from './session-manager.js';
+import type { Message } from './types.js';
 
 describe('SessionManager', () => {
   it('creates sessions with generated ids and empty history', () => {
@@ -49,5 +51,26 @@ describe('SessionManager', () => {
   it('returns undefined idle duration for an unknown session', () => {
     const manager = new SessionManager();
     expect(manager.idleDurationMs('missing')).toBeUndefined();
+  });
+
+  it('emits message:appended for every role when an event bus is injected', () => {
+    const bus = new EventBus<{ 'message:appended': { message: Message } }>();
+    const emitted: Message[] = [];
+    bus.on('message:appended', (payload) => emitted.push(payload.message));
+    const manager = new SessionManager({ eventBus: bus });
+    const session = manager.create();
+
+    const user = manager.appendMessage(session.id, 'user', 'hi');
+    const agent = manager.appendMessage(session.id, 'agent', 'hello back');
+
+    expect(emitted).toEqual([user, agent]);
+  });
+
+  it('behaves identically without an event bus (backwards compatible)', () => {
+    const manager = new SessionManager();
+    const session = manager.create();
+    const message = manager.appendMessage(session.id, 'user', 'hi');
+    expect(message.role).toBe('user');
+    expect(session.messages).toEqual([message]);
   });
 });

@@ -73,6 +73,32 @@ export function evolveEmotion(
   };
 }
 
+/** Coupling knobs applied when the user messages the agent. */
+export interface UserMessageCouplingConfig {
+  /** Amount added to `arousal` (result clamped to `[0, 1]`). */
+  userMessageArousalBump: number;
+  /** `socialNeed` is capped to this value (never raised). */
+  interactionSocialNeedReset: number;
+}
+
+/**
+ * Apply the "user just messaged us" coupling to an already-evolved state.
+ *
+ * Rationale (mirrors hermes-active): a present user satisfies the agent's urge
+ * to reach out, so `socialNeed` drops, while excitement (`arousal`) rises.
+ * Pure: callers evolve to now first, then apply, then store.
+ */
+export function applyUserMessageCoupling(
+  state: EmotionState,
+  config: UserMessageCouplingConfig,
+): EmotionState {
+  return {
+    valence: state.valence,
+    arousal: clamp01(state.arousal + config.userMessageArousalBump),
+    socialNeed: Math.min(clamp01(state.socialNeed), clamp01(config.interactionSocialNeedReset)),
+  };
+}
+
 /** Blend an evolved state with an LLM assessment (`evolved*0.4 + llm*0.6`). */
 export function mergeEmotionAssessment(
   evolved: EmotionState,
@@ -150,6 +176,11 @@ export class EmotionStore {
   /** Number of tracked sessions. */
   get size(): number {
     return this.#states.size;
+  }
+
+  /** Ids of every tracked session. */
+  sessions(): string[] {
+    return [...this.#states.keys()];
   }
 
   /** Evolve the session state to `now()` and return a copy. */

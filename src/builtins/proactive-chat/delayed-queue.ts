@@ -91,6 +91,20 @@ export class DelayedQueue {
   }
 
   /**
+   * Replace a session's queue with restored stubs, pruned to current rules:
+   * stubs older than `maxAgeHours` are dropped and the queue is capped at
+   * `maxSize`, keeping the highest-scoring stubs (matching eviction order).
+   */
+  restore(sessionId: string, stubs: readonly HeldStub[]): void {
+    const now = this.#now();
+    const fresh = stubs.filter((stub) => now - stub.enqueuedAt <= this.#maxAgeMs);
+    const trimmed = [...fresh]
+      .sort((a, b) => b.scoreAtEnqueue - a.scoreAtEnqueue)
+      .slice(0, this.#maxSize);
+    this.#store(sessionId, trimmed);
+  }
+
+  /**
    * Re-score every held stub for a session.
    *
    * @param scoreOf Current score for a stub.

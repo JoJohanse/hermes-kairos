@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../core/event-bus.js';
 import { SessionManager } from '../core/session-manager.js';
+import { JsonStore } from '../core/storage.js';
 import type { Message } from '../core/types.js';
 import { MockProvider } from '../llm/mock.js';
 import { Scheduler } from '../scheduler/scheduler.js';
@@ -14,6 +15,8 @@ function makeContext(): PluginContext {
     sessions: new SessionManager(),
     scheduler: new Scheduler(),
     llm: new MockProvider(),
+    // Never touched by these tests; a real store with an unused dir is fine.
+    storage: new JsonStore({ dataDir: 'hermes-test-unused' }),
     config: {},
     send: async (sessionId: string, content: string): Promise<Message> => ({
       id: randomId(),

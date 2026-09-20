@@ -1,14 +1,43 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventBus, type EventHandler, type EventMap } from '../../core/event-bus.js';
 import type { RuntimeConfig } from '../../core/runtime.js';
 import { HermesRuntime } from '../../core/runtime.js';
+import { SessionManager } from '../../core/session-manager.js';
+import { JsonStore, type JsonStoreFs } from '../../core/storage.js';
+import type { Message } from '../../core/types.js';
 import { MockProvider } from '../../llm/mock.js';
 import type { CompletionRequest, CompletionResult, LLMProvider } from '../../llm/types.js';
-import { createProactiveChatPlugin } from './index.js';
-import type {
-  ProactiveHeldEvent,
-  ProactiveSkippedEvent,
-  ProactiveThoughtEvent,
+import type { PluginContext } from '../../plugins/types.js';
+import { Scheduler } from '../../scheduler/scheduler.js';
+import { resolveProactiveChatConfig } from '../../config/config.js';
+import { decide } from './decision.js';
+import {
+  applyUserMessageCoupling,
+  DEFAULT_EMOTION_DYNAMICS,
+  evolveEmotion,
+} from './emotion.js';
+import { ProactiveChatPlugin, PROACTIVE_CHAT_STATE_NAME } from './index.js';
+import {
+  PROACTIVE_CHAT_SNAPSHOT_VERSION,
+  type EmotionState,
+  type HeldStub,
+  type ProactiveChatSnapshot,
+  type ProactiveHeldEvent,
+  type ProactiveSkippedEvent,
+  type ProactiveThoughtEvent,
 } from './types.js';
+
+const tempDirs: string[] = [];
+
+/** Per-runtime temp data dir so runs never share persisted plugin state. */
+function makeDataDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'hermes-plugin-'));
+  tempDirs.push(dir);
+  return dir;
+}
 
 /** Resolved plugin slice used by the integration tests, with low thresholds. */
 function pluginSlice(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -53,9 +82,10 @@ function holdSlice(overrides: Record<string, unknown> = {}): Record<string, unkn
   });
 }
 
-function runtimeConfig(slice: Record<string, unknown>): RuntimeConfig {
+function runtimeConfig(slice: Record<string, unknown>, dataDir: string = makeDataDir()): RuntimeConfig {
   return {
     llm: { baseURL: 'http://localhost:0/v1', apiKey: '', model: 'mock' },
+    storage: { dataDir },
     plugins: { proactiveChat: slice },
   };
 }
@@ -71,10 +101,13 @@ interface BootOptions {
   /** Provider override (e.g. a deferred provider). Defaults to a MockProvider. */
   provider?: LLMProvider;
   response?: string;
+  /** Reuse a specific data dir (for restart/persistence tests). */
+  dataDir?: string;
 }
 
 interface BootResult {
   runtime: HermesRuntime;
+  plugin: ProactiveChatPlugin;
   llm: LLMProvider;
   outbound: Outbound[];
   skipped: ProactiveSkippedEvent[];
@@ -86,10 +119,11 @@ async function boot(options: BootOptions = {}): Promise<BootResult> {
   const llm: LLMProvider =
     options.provider ?? new MockProvider({ response: options.response ?? 'Hey, long time no chat!' });
   const runtime = new HermesRuntime({
-    config: runtimeConfig(options.slice ?? pluginSlice()),
+    config: runtimeConfig(options.slice ?? pluginSlice(), options.dataDir),
     llm,
   });
-  runtime.register(createProactiveChatPlugin());
+  const plugin = new ProactiveChatPlugin();
+  runtime.register(plugin);
   const outbound: Outbound[] = [];
   const skipped: ProactiveSkippedEvent[] = [];
   const held: ProactiveHeldEvent[] = [];
@@ -99,7 +133,7 @@ async function boot(options: BootOptions = {}): Promise<BootResult> {
   runtime.eventBus.on('proactive:held', (payload) => held.push(payload as ProactiveHeldEvent));
   runtime.eventBus.on('proactive:thought', (payload) => thought.push(payload as ProactiveThoughtEvent));
   await runtime.start();
-  return { runtime, llm, outbound, skipped, held, thought };
+  return { runtime, plugin, llm, outbound, skipped, held, thought };
 }
 
 /** Provider whose completion stays pending until the test resolves it. */
@@ -124,6 +158,117 @@ class DeferredProvider implements LLMProvider {
   }
 }
 
+/** In-memory filesystem that counts reads/writes for persistence assertions. */
+class MemoryFs implements JsonStoreFs {
+  readonly files = new Map<string, string>();
+  readonly dirs = new Set<string>();
+  readCount = 0;
+  writeCount = 0;
+
+  exists(path: string): boolean {
+    return this.files.has(path);
+  }
+
+  readFile(path: string): string {
+    this.readCount += 1;
+    const data = this.files.get(path);
+    if (data === undefined) throw new Error(`ENOENT: ${path}`);
+    return data;
+  }
+
+  writeFile(path: string, data: string): void {
+    this.writeCount += 1;
+    this.files.set(path, data);
+  }
+
+  rename(from: string, to: string): void {
+    const data = this.files.get(from);
+    if (data === undefined) throw new Error(`ENOENT: ${from}`);
+    this.files.delete(from);
+    this.files.set(to, data);
+  }
+
+  mkdir(path: string): void {
+    this.dirs.add(path);
+  }
+}
+
+/** EventBus that counts unsubscribe calls, to prove plugin teardown unsubscribes. */
+class RecordingBus extends EventBus {
+  unsubscribeCalls = 0;
+
+  override on<K extends keyof EventMap & string>(
+    topic: K,
+    handler: EventHandler<EventMap[K]>,
+  ): () => void {
+    const unsubscribe = super.on(topic, handler);
+    return () => {
+      this.unsubscribeCalls += 1;
+      unsubscribe();
+    };
+  }
+}
+
+interface ContextHandle {
+  ctx: PluginContext;
+  bus: EventBus;
+  sessions: SessionManager;
+  scheduler: Scheduler;
+  fs: MemoryFs;
+}
+
+/** Build a PluginContext directly, with an injectable in-memory filesystem. */
+function makePluginContext(
+  options: { bus?: EventBus; fs?: MemoryFs; slice?: Record<string, unknown> } = {},
+): ContextHandle {
+  const bus = options.bus ?? new EventBus();
+  const sessions = new SessionManager({ eventBus: bus });
+  const scheduler = new Scheduler();
+  const fs = options.fs ?? new MemoryFs();
+  const ctx: PluginContext = {
+    eventBus: bus,
+    sessions,
+    scheduler,
+    llm: new MockProvider({ response: 'persisted thought' }),
+    storage: new JsonStore({ dataDir: 'data', fs }),
+    config: { proactiveChat: options.slice ?? pluginSlice() },
+    send: async (sessionId, content): Promise<Message> => {
+      const message = sessions.appendMessage(sessionId, 'agent', content);
+      bus.emit('message:outbound', { sessionId, content, timestamp: message.timestamp });
+      return message;
+    },
+  };
+  return { ctx, bus, sessions, scheduler, fs };
+}
+
+function writeSnapshot(fs: MemoryFs, snapshot: ProactiveChatSnapshot): void {
+  fs.files.set(
+    join('data', `${PROACTIVE_CHAT_STATE_NAME}.json`),
+    JSON.stringify(snapshot),
+  );
+}
+
+function heldStub(sessionId: string, enqueuedAt: number, score: number): HeldStub {
+  return {
+    sessionId,
+    enqueuedAt,
+    scoreAtEnqueue: score,
+    breakdown: {
+      valence: 0.5,
+      arousal: 0.5,
+      socialNeed: 0.5,
+      intensity: 0.5,
+      timeFitness: 1,
+      silenceFactor: 1,
+      frequencyLimit: 1,
+      silenceMinutes: 60,
+      sentThisHour: 0,
+      sentToday: 0,
+      score,
+    },
+  };
+}
+
 describe('ProactiveChatPlugin (integration)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -131,6 +276,10 @@ describe('ProactiveChatPlugin (integration)', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('sends exactly one message, then respects the cooldown', async () => {
@@ -242,8 +391,8 @@ describe('ProactiveChatPlugin (integration)', () => {
     const session = runtime.sessions.create();
     runtime.sessions.appendMessage(session.id, 'user', 'hi');
 
-    // 10:00 → score bands to HOLD; no LLM call, a stub is queued.
-    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    // 08:30 → score bands to HOLD; no LLM call, a stub is queued.
+    vi.setSystemTime(new Date(2026, 0, 15, 8, 30, 0));
     await vi.advanceTimersByTimeAsync(60_000);
     expect(held).toHaveLength(1);
     expect(held[0]?.sessionId).toBe(session.id);
@@ -279,7 +428,7 @@ describe('ProactiveChatPlugin (integration)', () => {
     const session = runtime.sessions.create();
     runtime.sessions.appendMessage(session.id, 'user', 'hi');
 
-    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    vi.setSystemTime(new Date(2026, 0, 15, 8, 30, 0));
     await vi.advanceTimersByTimeAsync(60_000);
     expect(held).toHaveLength(1);
 
@@ -371,5 +520,256 @@ describe('ProactiveChatPlugin (integration)', () => {
 
     expect(outbound).toHaveLength(0);
     expect(session.messages.filter((message) => message.role === 'agent')).toHaveLength(0);
+  });
+
+  describe('user-message coupling (F7)', () => {
+    it('raises arousal and resets socialNeed on a user message', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const { runtime, plugin } = await boot({ slice: pluginSlice() });
+      const session = runtime.sessions.create();
+
+      expect(plugin.emotionState(session.id)).toBeUndefined();
+      runtime.sessions.appendMessage(session.id, 'user', 'hello');
+
+      expect(plugin.emotionState(session.id)).toEqual({
+        valence: 0.7,
+        arousal: 1,
+        socialNeed: 0.1,
+      });
+      await runtime.stop();
+    });
+
+    it('does not couple agent-authored messages', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const { runtime, plugin } = await boot({ slice: pluginSlice() });
+      const session = runtime.sessions.create();
+
+      runtime.sessions.appendMessage(session.id, 'agent', 'proactive hello');
+
+      expect(plugin.emotionState(session.id)).toBeUndefined();
+      await runtime.stop();
+    });
+
+    it('unsubscribes on teardown so later events cannot mutate state', () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const bus = new RecordingBus();
+      const { ctx } = makePluginContext({
+        bus,
+        slice: pluginSlice({ persistence: { enabled: false } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      expect(bus.unsubscribeCalls).toBe(0);
+
+      plugin.teardown();
+      expect(bus.unsubscribeCalls).toBe(1);
+
+      const message: Message = {
+        id: 'm1',
+        sessionId: 'ghost',
+        role: 'user',
+        content: 'hi',
+        timestamp: Date.now(),
+      };
+      ctx.eventBus.emit('message:appended', { message });
+      expect(plugin.emotionState('ghost')).toBeUndefined();
+    });
+
+    it('lowers the proactive score, all else equal, after a user interaction', () => {
+      const emotion: EmotionState = { valence: 0.7, arousal: 0.8, socialNeed: 0.5 };
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      const config = resolveProactiveChatConfig(pluginSlice()).decision;
+      const input = {
+        now,
+        lastMessageAt: now - 2 * 60 * 60_000,
+        lastProactiveSendAt: undefined,
+        sentThisHour: 0,
+        sentToday: 0,
+        config,
+      };
+
+      const before = decide({ emotion, ...input });
+      const coupled = applyUserMessageCoupling(emotion, {
+        userMessageArousalBump: 0.3,
+        interactionSocialNeedReset: 0.1,
+      });
+      const after = decide({ emotion: coupled, ...input });
+
+      expect(after.score).toBeLessThan(before.score);
+    });
+  });
+
+  describe('persistence (F7 restart amnesia)', () => {
+    it('persists and restores per-session state across a restart', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const dataDir = makeDataDir();
+      const slice = pluginSlice();
+
+      const first = await boot({ slice, dataDir });
+      const session = first.runtime.sessions.create();
+      first.runtime.sessions.appendMessage(session.id, 'user', 'hi');
+
+      // A tick evolves emotion and delivers, recording a send.
+      vi.setSystemTime(new Date(2026, 0, 15, 8, 30, 0));
+      await vi.advanceTimersByTimeAsync(60_000);
+      const savedEmotion = first.plugin.emotionState(session.id);
+      const savedSends = [...first.plugin.sendTimestamps(session.id)];
+      expect(savedEmotion).toBeDefined();
+      expect(savedSends).toHaveLength(1);
+      await first.runtime.stop();
+
+      const second = await boot({ slice, dataDir });
+      expect(second.plugin.emotionState(session.id)).toEqual(savedEmotion);
+      expect([...second.plugin.sendTimestamps(session.id)]).toEqual(savedSends);
+      await second.runtime.stop();
+    });
+
+    it('evolves restored emotion forward by the wall-clock gap', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const dataDir = makeDataDir();
+      const slice = pluginSlice();
+
+      const first = await boot({ slice, dataDir });
+      const session = first.runtime.sessions.create();
+      first.runtime.sessions.appendMessage(session.id, 'user', 'hi');
+      const saved = first.plugin.emotionState(session.id);
+      expect(saved).toBeDefined();
+      await first.runtime.stop();
+
+      // 12 hours later the same snapshot is restored and evolved forward.
+      vi.setSystemTime(new Date(2026, 0, 15, 15, 0, 0));
+      const second = await boot({ slice, dataDir });
+      const expected = evolveEmotion(
+        saved as EmotionState,
+        12 * 60 * 60_000,
+        DEFAULT_EMOTION_DYNAMICS,
+      );
+      expect(second.plugin.emotionState(session.id)).toEqual(expected);
+      await second.runtime.stop();
+    });
+
+    it('starts fresh and warns when the state file is corrupt', async () => {
+      const dataDir = makeDataDir();
+      writeFileSync(join(dataDir, `${PROACTIVE_CHAT_STATE_NAME}.json`), '{ not json', 'utf8');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const { runtime, plugin } = await boot({ slice: pluginSlice(), dataDir });
+
+        expect(plugin.emotionState('anything')).toBeUndefined();
+        expect(
+          warn.mock.calls.some((call) => String(call[0]).includes('corrupt JSON')),
+        ).toBe(true);
+        await runtime.stop();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('uses a real store when no storage stub is supplied (round-trip writes)', async () => {
+      const dataDir = makeDataDir();
+      const { runtime, plugin } = await boot({ slice: pluginSlice(), dataDir });
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi');
+      await runtime.stop();
+
+      const second = await boot({ slice: pluginSlice(), dataDir });
+      expect(second.plugin.emotionState(session.id)).toBeDefined();
+      await second.runtime.stop();
+    });
+
+    it('does not read or write when persistence is disabled', () => {
+      const fs = new MemoryFs();
+      const { ctx } = makePluginContext({
+        fs,
+        slice: pluginSlice({ persistence: { enabled: false } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+
+      plugin.init(ctx);
+      expect(fs.readCount).toBe(0);
+
+      plugin.teardown();
+      expect(fs.writeCount).toBe(0);
+    });
+
+    it('saves immediately after a delivery, independent of the periodic interval', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 5, 0, 0));
+      const fs = new MemoryFs();
+      const { ctx, scheduler, sessions } = makePluginContext({
+        fs,
+        slice: pluginSlice({ persistence: { enabled: true, saveIntervalTicks: 100_000 } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+      scheduler.start();
+      const session = sessions.create();
+      sessions.appendMessage(session.id, 'user', 'hi');
+      expect(fs.writeCount).toBe(0);
+
+      vi.setSystemTime(new Date(2026, 0, 15, 7, 0, 0));
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(1);
+      expect(fs.writeCount).toBe(1);
+
+      plugin.teardown();
+      expect(fs.writeCount).toBe(2);
+    });
+
+    it('prunes expired stubs and stale sends when restoring', () => {
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      vi.setSystemTime(now);
+      const fs = new MemoryFs();
+      const staleSend = now - 25 * 60 * 60_000;
+      const freshSend = now - 60 * 60_000;
+      const freshStub = heldStub('s1', now - 60 * 60_000, 0.4);
+      const expiredStub = heldStub('s1', now - 10 * 60 * 60_000, 0.9);
+      writeSnapshot(fs, {
+        version: PROACTIVE_CHAT_SNAPSHOT_VERSION,
+        savedAt: now,
+        sessions: {
+          s1: {
+            emotion: { valence: 0.5, arousal: 0.5, socialNeed: 0.5 },
+            sends: [staleSend, freshSend],
+            queue: [freshStub, expiredStub],
+          },
+        },
+      });
+
+      const { ctx } = makePluginContext({
+        fs,
+        slice: pluginSlice({ delayedQueue: { maxSize: 10, maxAgeHours: 4 } }),
+      });
+      const plugin = new ProactiveChatPlugin();
+      plugin.init(ctx);
+
+      expect([...plugin.heldStubs('s1')]).toEqual([freshStub]);
+      expect([...plugin.sendTimestamps('s1')]).toEqual([freshSend]);
+      plugin.teardown();
+    });
+
+    it('ignores a snapshot with an unsupported version', () => {
+      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+      vi.setSystemTime(now);
+      const fs = new MemoryFs();
+      writeSnapshot(fs, {
+        version: 999 as unknown as typeof PROACTIVE_CHAT_SNAPSHOT_VERSION,
+        savedAt: now,
+        sessions: { s1: { emotion: { valence: 0.5, arousal: 0.5, socialNeed: 0.5 }, sends: [], queue: [] } },
+      });
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const { ctx } = makePluginContext({ fs });
+        const plugin = new ProactiveChatPlugin();
+        plugin.init(ctx);
+
+        expect(plugin.emotionState('s1')).toBeUndefined();
+        expect(warn.mock.calls.some((call) => String(call[0]).includes('unsupported'))).toBe(true);
+        plugin.teardown();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 });

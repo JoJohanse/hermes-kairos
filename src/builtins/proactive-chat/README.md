@@ -23,6 +23,8 @@ what to say.
 | Delayed queue for HOLD-band stubs (`delayed-queue.ts`) | done |
 | Context bundle (`context.ts`) | done |
 | LLM thought generation + `SKIP` veto (`thought-engine.ts`) | done |
+| User-message coupling (`message:appended` → emotion) | done |
+| Per-session state persistence (`JsonStore`) | done |
 | Outbound send path (`ctx.send` → `message:outbound`) | provided by kernel |
 
 ## Heartbeat pipeline
@@ -102,20 +104,87 @@ Per session, evolving purely by elapsed wall-clock time:
 
 States live in an in-memory `Map` (`EmotionStore`) keyed by session id, with an
 injectable clock. Pure functions (`evolveEmotion`, `mergeEmotionAssessment`,
-`parseEmotionAssessment`) carry the maths.
+`parseEmotionAssessment`, `applyUserMessageCoupling`) carry the maths.
+
+#### Interaction coupling
+
+A user who just messaged is *present*, so the urge to reach out should drop
+while excitement rises. On every `message:appended` with `role === 'user'` the
+plugin evolves that session's emotion to now, then:
+
+- `arousal = min(1, arousal + emotion.userMessageArousalBump)` (default `0.3`);
+- `socialNeed = min(socialNeed, emotion.interactionSocialNeedReset)` (default
+  `0.1`) — never raised.
+
+Agent-authored messages deliberately do **not** couple (otherwise the plugin
+would feed its own outreach back into its model of the user's absence).
 
 ### State & timezone
 
 - Quiet hours (and time-of-day fitness windows) are evaluated in the
   **server-local timezone** via `Date#getHours/getMinutes`.
-- All runtime state — sessions/messages, per-session emotion, the HOLD stub
-  queue and send counters — is **in-memory** and resets when the process
-  restarts.
+- Per-session plugin state — emotion, HOLD stubs and send timestamps — is
+  persisted (see below), so it survives restarts. Session transcripts remain
+  kernel-owned and in-memory.
+
+### Persistence
+
+`init()` restores and `teardown()`/periodic ticks/a successful delivery save the
+plugin's entire per-session state to `<storage.dataDir>/proactive-chat.json`
+via the kernel `JsonStore` (default `dataDir` `.hermes-data`).
+
+Snapshot shape:
+
+```jsonc
+{
+  "version": 1,
+  "savedAt": 1700000000000,
+  "sessions": {
+    "<sessionId>": {
+      "emotion": { "valence": 0.6, "arousal": 0.4, "socialNeed": 0.9 },
+      "sends": [1700000000000],          // proactive send timestamps
+      "queue": [ /* HeldStub[] */ ]
+    }
+  }
+}
+```
+
+Semantics:
+
+- **What is restored**: every session's emotion, held HOLD stubs and send
+  timestamps. Emotions are **evolved forward** by the wall-clock gap
+  (`now - savedAt`), so time spent down still counts.
+- **What is pruned on restore**: send timestamps older than 24h, stubs older
+  than `delayedQueue.maxAgeHours`, and queues beyond `delayedQueue.maxSize`
+  (highest-scoring stubs kept). A version mismatch or malformed envelope is
+  ignored (fresh start + warning).
+- **Corruption/missing file**: `JsonStore.read` logs a `console.warn` and
+  returns nothing; the plugin simply starts fresh. Storage failures never crash
+  the heartbeat.
+- **How to disable**: `plugins.proactiveChat.persistence.enabled = false`
+  (disables both load and save).
+- **Save timing**: on teardown, every `persistence.saveIntervalTicks` (default
+  `20`) heartbeats, and immediately after each successful delivery so cooldown
+  state is crash-safe.
+
+#### Not persisted: sessions/messages
+
+Session transcripts are deliberately **not** part of this snapshot. They are a
+kernel concern: `SessionManager` is in-memory and its `appendMessage` is the
+single authoritative mutation, so re-hydrating messages would either duplicate
+history (if restore appends) or bypass the `message:appended`/`message:outbound`
+observability contract (if it writes state directly). The natural shape later
+is a kernel-provided `SessionStore` (or a `sessions` plugin) that restores
+transcripts *before* plugins init and replays nothing — this plugin would then
+read transcripts through `ctx.sessions` unchanged. It is deferred because
+today's transport-less runtime creates no sessions at boot, so there is nothing
+to restore.
 
 ### Events
 
 | Topic | Payload |
 | --- | --- |
+| `message:appended` (consumed) | `{ message }` — kernel event, drives interaction coupling |
 | `proactive:thought` | `{ sessionId, content, score, breakdown, stimuli, timestamp }` |
 | `proactive:held` | `{ sessionId, score, breakdown, queueSize, accepted }` (no `content`: HOLD stubs are queued before generation) |
 | `proactive:skipped` | `{ sessionId, reason }` |
@@ -143,20 +212,27 @@ injectable clock. Pure functions (`evolveEmotion`, `mergeEmotionAssessment`,
         "decayRatePerHour": 0.1,
         "socialNeedGrowthPerHour": 0.2,
         "arousalFloor": 0.2,
-        "useLlmAssessment": false
+        "useLlmAssessment": false,
+        "userMessageArousalBump": 0.3,
+        "interactionSocialNeedReset": 0.1
       },
       "context": { "historyTailMessages": 20 },
       "delayedQueue": { "maxSize": 10, "maxAgeHours": 4 },
-      "persona": { "systemPrompt": "<defaults to prompts.ts>" }
+      "persona": { "systemPrompt": "<defaults to prompts.ts>" },
+      "persistence": { "enabled": true, "saveIntervalTicks": 20 }
     }
   },
+  "storage": { "dataDir": ".hermes-data" },
   "llm": { "requestTimeoutMs": 30000 }
 }
 ```
 
 `resolveProactiveChatConfig` defensively fills every field and also honors the
 deprecated placeholders (`checkIntervalMs`, `idleThresholdMs`,
-`maxInitiationsPerHour`) when their replacements are absent.
+`maxInitiationsPerHour`) when their replacements are absent. Malformed fields
+are replaced by defaults and reported through an optional `onWarn` callback
+(`loadConfig`/`resolveProactiveChatConfig`; defaults to `console.warn` with a
+`[config]` prefix).
 
 ## Module layout
 
@@ -164,12 +240,12 @@ deprecated placeholders (`checkIntervalMs`, `idleThresholdMs`,
 | --- | --- |
 | `types.ts` | Shared shapes (pure, dependency-free) |
 | `prompts.ts` | Default prompt/persona string constants |
-| `emotion.ts` | Emotion maths + in-memory store |
+| `emotion.ts` | Emotion maths + in-memory store (incl. user-message coupling, pure) |
 | `decision.ts` | Guardrails + scoring + banding (pure) |
-| `delayed-queue.ts` | Per-session HOLD stub queue with re-score/expiry/eviction |
+| `delayed-queue.ts` | Per-session HOLD stub queue with re-score/expiry/eviction/restore |
 | `context.ts` | `ContextBundle` builder from `SessionManager` |
 | `thought-engine.ts` | Prompt construction, `SKIP` parsing, candidate creation |
-| `index.ts` | `ProactiveChatPlugin`: config, heartbeat, counters, events |
+| `index.ts` | `ProactiveChatPlugin`: config, heartbeat, counters, coupling, persistence, events |
 
 Deterministic modules (`decision`, `emotion`, `delayed-queue`) never import
 runtime singletons — all state and clocks are passed in.
@@ -181,6 +257,9 @@ runtime singletons — all state and clocks are passed in.
 - `ctx.send(sessionId, content)` appends an `agent` message and emits
   `message:outbound`; plugins never append messages directly.
 - `teardown()` first sets an internal `#stopped` flag (so an in-flight heartbeat
-  that is awaiting the LLM aborts before sending or emitting), then cancels the
-  heartbeat and clears emotion/queue/counter state. `init()` resets the flag, so
+  that is awaiting the LLM aborts before sending or emitting), then unsubscribes
+  from `message:appended`, saves a final snapshot, cancels the heartbeat and
+  clears emotion/queue/counter state. `init()` resets the flag, so
   re-initialization works.
+- Persistence is a pure edge concern: `JsonStore` I/O is wrapped in try/catch,
+  so a failing disk logs a warning and never breaks the heartbeat.
