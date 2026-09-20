@@ -6,9 +6,14 @@ export interface OpenAICompatibleOptions {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** Per-request timeout in milliseconds. Defaults to `30_000`. */
+  requestTimeoutMs?: number;
   /** Injectable fetch implementation (defaults to the global `fetch`). */
   fetchImpl?: typeof fetch;
 }
+
+/** Default per-request timeout in milliseconds. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: string | null } | null } | null> | null;
@@ -23,12 +28,15 @@ export class OpenAICompatibleProvider {
   readonly #baseURL: string;
   readonly #apiKey: string;
   readonly #model: string;
+  readonly #requestTimeoutMs: number;
   readonly #fetch: typeof fetch;
 
   constructor(options: OpenAICompatibleOptions) {
     this.#baseURL = options.baseURL.replace(/\/+$/, '');
     this.#apiKey = options.apiKey;
     this.#model = options.model;
+    const timeout = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.#requestTimeoutMs = Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_REQUEST_TIMEOUT_MS;
     const impl = options.fetchImpl ?? globalThis.fetch;
     if (typeof impl !== 'function') {
       throw new Error(
@@ -63,6 +71,9 @@ export class OpenAICompatibleProvider {
         ...(this.#apiKey === '' ? {} : { authorization: `Bearer ${this.#apiKey}` }),
       },
       body: JSON.stringify(body),
+      // The timer only starts when `fetch` is called, so injecting a fetch impl
+      // (tests) never opens a real network connection.
+      signal: AbortSignal.timeout(this.#requestTimeoutMs),
     });
 
     if (!response.ok) {

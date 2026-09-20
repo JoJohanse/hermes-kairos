@@ -99,6 +99,13 @@ export interface DecisionInput {
   config: ProactiveDecisionConfig;
 }
 
+/**
+ * Inputs to {@link evaluateGuardrails}. Guardrails are emotion-independent, so
+ * callers can cheaply check whether a send is even possible before spending an
+ * LLM call on emotion assessment or thought generation.
+ */
+export type GuardrailInput = Omit<DecisionInput, 'emotion'>;
+
 /** Result of {@link decide}. `veto` non-null implies `outcome === 'skip'`. */
 export interface DecisionResult {
   outcome: DecisionOutcome;
@@ -119,7 +126,10 @@ export function decide(input: DecisionInput): DecisionResult {
 
   const silenceMs =
     input.lastMessageAt === undefined ? Number.POSITIVE_INFINITY : now - input.lastMessageAt;
-  const intensity = (input.emotion.valence + input.emotion.arousal + input.emotion.socialNeed) / 3;
+  // `socialNeed` is weighted 3×: it is the only signal that keeps growing while
+  // a session sits idle, so long-run reachability depends on it.
+  const intensity =
+    (input.emotion.valence + input.emotion.arousal + 3 * input.emotion.socialNeed) / 5;
   const timeFitness = timeFitnessAt(now, windows);
   const silenceFactor = silenceFactorFor(silenceMs);
   const frequencyLimit = Math.max(0.1, 1 - input.sentThisHour / config.maxPerHour);
@@ -139,7 +149,7 @@ export function decide(input: DecisionInput): DecisionResult {
     score,
   };
 
-  const veto = firstVeto(input, silenceMs);
+  const veto = evaluateGuardrails(input);
   if (veto !== null) {
     return { outcome: 'skip', score, breakdown, veto };
   }
@@ -152,7 +162,16 @@ export function decide(input: DecisionInput): DecisionResult {
   return { outcome, score, breakdown, veto: null };
 }
 
-function firstVeto(input: DecisionInput, silenceMs: number): GuardrailVeto | null {
+/**
+ * Check the hard guardrails for a session, in priority order: quiet hours,
+ * recent activity, cooldown, hourly cap, daily cap.
+ *
+ * Guardrails do not depend on the emotion state, so callers can (and the
+ * plugin does) run these before any LLM call.
+ *
+ * @returns the first firing {@link GuardrailVeto}, or `null` when none fire.
+ */
+export function evaluateGuardrails(input: GuardrailInput): GuardrailVeto | null {
   const { config, now } = input;
 
   if (isWithinQuietHours(now, config.quietHours)) return 'quiet_hours';
@@ -171,11 +190,6 @@ function firstVeto(input: DecisionInput, silenceMs: number): GuardrailVeto | nul
   if (input.sentToday >= config.maxPerDay) return 'daily_cap';
 
   return null;
-}
-
-/** Exported for callers that want the raw hour bucket (0–23) of a timestamp. */
-export function hourOfDay(nowMs: number): number {
-  return new Date(nowMs).getHours();
 }
 
 /** Milliseconds in an hour, re-exported for counter windows. */

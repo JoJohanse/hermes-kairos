@@ -15,9 +15,6 @@ export type EventHandler<T> = (payload: T) => void;
 /** Function returned by {@link EventBus.on} that removes the subscription. */
 export type Unsubscribe = () => void;
 
-/** Alias kept for readability at call sites. */
-export type EventBusTopics = EventMap;
-
 /**
  * In-memory event bus. `M` describes the known topics; an index signature on
  * `M` allows arbitrary string topics when the consumer does not declare them.

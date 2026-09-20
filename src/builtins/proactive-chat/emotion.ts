@@ -7,18 +7,20 @@
  */
 
 import type { EmotionState } from './types.js';
-import { EMOTION_ASSESSMENT_INSTRUCTION } from './prompts.js';
 
 /** Emotion dynamics knobs (a subset of the resolved plugin config). */
 export interface EmotionDynamicsConfig {
   decayRatePerHour: number;
   socialNeedGrowthPerHour: number;
+  /** Floor `arousal` decays toward; never reaches zero. */
+  arousalFloor: number;
 }
 
 /** Default dynamics matching `ProactiveChatConfig.emotion`. */
 export const DEFAULT_EMOTION_DYNAMICS: EmotionDynamicsConfig = {
   decayRatePerHour: 0.1,
   socialNeedGrowthPerHour: 0.2,
+  arousalFloor: 0.2,
 };
 
 /**
@@ -50,7 +52,7 @@ export function clamp01(value: number): number {
  * Advance an emotion state by `elapsedMs` of pure wall-clock time.
  *
  * - `socialNeed` grows linearly and saturates at `1`.
- * - `arousal` decays exponentially.
+ * - `arousal` decays exponentially toward `arousalFloor` (never to zero).
  * - `valence` regresses exponentially toward the `0.5` baseline.
  */
 export function evolveEmotion(
@@ -63,9 +65,10 @@ export function evolveEmotion(
     return { valence: state.valence, arousal: state.arousal, socialNeed: state.socialNeed };
   }
   const decay = Math.exp(-config.decayRatePerHour * hours);
+  const floor = clamp01(config.arousalFloor);
   return {
     valence: clamp01(0.5 + (state.valence - 0.5) * decay),
-    arousal: clamp01(state.arousal * decay),
+    arousal: clamp01(floor + (state.arousal - floor) * decay),
     socialNeed: clamp01(state.socialNeed + config.socialNeedGrowthPerHour * hours),
   };
 }
@@ -179,6 +182,3 @@ export class EmotionStore {
     this.#states.clear();
   }
 }
-
-/** Re-exported so callers can build the assessment prompt without importing prompts.ts. */
-export { EMOTION_ASSESSMENT_INSTRUCTION };

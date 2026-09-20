@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_PROACTIVE_CHAT } from '../../config/config.js';
 import {
   decide,
+  evaluateGuardrails,
   isWithinQuietHours,
   parseClockToMinutes,
   silenceFactorFor,
@@ -9,7 +10,10 @@ import {
   DEFAULT_TIME_WINDOWS,
 } from './decision.js';
 import type { DecisionInput } from './decision.js';
+import { DEFAULT_EMOTION_DYNAMICS, DEFAULT_EMOTION_STATE, evolveEmotion } from './emotion.js';
 import type { EmotionState, ProactiveDecisionConfig } from './types.js';
+
+const HOUR_MS = 3_600_000;
 
 const CONFIG: ProactiveDecisionConfig = { ...DEFAULT_PROACTIVE_CHAT.decision };
 
@@ -47,11 +51,12 @@ describe('decide – score math', () => {
     expect(result.score).toBeCloseTo(0.72);
   });
 
-  it('computes intensity as the mean of the emotion components', () => {
+  it('weights socialNeed 3x when computing intensity', () => {
     const result = decide(
       makeInput({ emotion: { valence: 0.3, arousal: 0.6, socialNeed: 0.9 } }),
     );
-    expect(result.breakdown.intensity).toBeCloseTo(0.6);
+    // (0.3 + 0.6 + 3 * 0.9) / 5 = 0.72
+    expect(result.breakdown.intensity).toBeCloseTo(0.72);
   });
 
   it.each([
@@ -158,6 +163,43 @@ describe('decide – threshold banding', () => {
   it('banded HOLD/SKIP results have no veto', () => {
     const result = decide(bandInput({ ...CONFIG, sendThreshold: 0.51, holdThreshold: 0.5 }));
     expect(result.veto).toBeNull();
+  });
+});
+
+describe('decide – long-run reachability (F3b)', () => {
+  it('generates for a session idle 48h at an 18:30 tick with default config', () => {
+    const now = at(18, 30);
+    const emotion = evolveEmotion(
+      DEFAULT_EMOTION_STATE,
+      48 * HOUR_MS,
+      DEFAULT_EMOTION_DYNAMICS,
+    );
+    const result = decide(makeInput({ now, lastMessageAt: now - 48 * HOUR_MS, emotion }));
+
+    expect(result.veto).toBeNull();
+    expect(result.outcome).toBe('generate');
+  });
+
+  it('keeps the long-run score ceiling at least 0.05 above the send threshold', () => {
+    const now = at(18, 30);
+    const longRun: EmotionState = { valence: 0.5, arousal: 0.2, socialNeed: 1 };
+    const result = decide(makeInput({ now, lastMessageAt: now - 48 * HOUR_MS, emotion: longRun }));
+
+    expect(result.score - CONFIG.sendThreshold).toBeGreaterThanOrEqual(0.05);
+  });
+
+  it('evaluateGuardrails vetoes without requiring an emotion state', () => {
+    const now = at(23, 45);
+    expect(
+      evaluateGuardrails({
+        now,
+        lastMessageAt: now - 60_000,
+        lastProactiveSendAt: undefined,
+        sentThisHour: 0,
+        sentToday: 0,
+        config: CONFIG,
+      }),
+    ).toBe('quiet_hours');
   });
 });
 

@@ -1,9 +1,16 @@
-import type { Message, Session } from '../../core/types.js';
+import type { Session } from '../../core/types.js';
 import type { LLMProvider } from '../../llm/types.js';
 import type { Plugin, PluginContext } from '../../plugins/types.js';
 import { resolveProactiveChatConfig, type ProactiveChatConfig } from '../../config/config.js';
-import { buildContextBundle } from './context.js';
-import { decide, ONE_DAY_MS, ONE_HOUR_MS } from './decision.js';
+import { buildContextBundle, type ContextBundle } from './context.js';
+import {
+  decide,
+  evaluateGuardrails,
+  ONE_DAY_MS,
+  ONE_HOUR_MS,
+  type DecisionResult,
+  type GuardrailInput,
+} from './decision.js';
 import { DelayedQueue } from './delayed-queue.js';
 import {
   DEFAULT_EMOTION_DYNAMICS,
@@ -13,9 +20,8 @@ import {
   parseEmotionAssessment,
 } from './emotion.js';
 import { EMOTION_ASSESSMENT_INSTRUCTION } from './prompts.js';
-import { generateThought, serializeContext } from './thought-engine.js';
-import type { ContextBundle } from './context.js';
-import type { EmotionState, ThoughtCandidate } from './types.js';
+import { generateThought, serializeContext, type ThoughtEngineResult } from './thought-engine.js';
+import type { EmotionState, HeldStub, ThoughtCandidate } from './types.js';
 
 /** Plugin name used for config lookup and registry identity. */
 export const PROACTIVE_CHAT_PLUGIN_NAME = 'proactive-chat';
@@ -38,6 +44,9 @@ export interface ProactiveChatPluginOptions {
  * A heartbeat runs a two-stage gate per candidate session: a deterministic
  * guardrail/score pass ({@link decide}) decides whether to *ask*, and the LLM
  * ({@link generateThought}) decides what to say — or vetoes with `SKIP`.
+ *
+ * LLM spend is deliberately minimized: guardrails run before any LLM call, and
+ * the HOLD band queues a contentless stub until a later tick promotes it.
  */
 export class ProactiveChatPlugin implements Plugin {
   readonly name = PROACTIVE_CHAT_PLUGIN_NAME;
@@ -47,6 +56,7 @@ export class ProactiveChatPlugin implements Plugin {
   #config: ProactiveChatConfig | undefined;
   #emotionStore: EmotionStore | undefined;
   #queue: DelayedQueue | undefined;
+  #stopped = false;
   readonly #sends = new Map<string, number[]>();
   readonly #nowFn: () => number;
 
@@ -65,6 +75,7 @@ export class ProactiveChatPlugin implements Plugin {
   }
 
   init(ctx: PluginContext): void {
+    this.#stopped = false;
     this.#ctx = ctx;
     this.#config = resolveProactiveChatConfig(ctx.config['proactiveChat']);
     this.#emotionStore = new EmotionStore({
@@ -72,6 +83,7 @@ export class ProactiveChatPlugin implements Plugin {
       config: {
         decayRatePerHour: this.#config.emotion.decayRatePerHour,
         socialNeedGrowthPerHour: this.#config.emotion.socialNeedGrowthPerHour,
+        arousalFloor: this.#config.emotion.arousalFloor,
       },
       initialState: DEFAULT_EMOTION_STATE,
     });
@@ -90,6 +102,8 @@ export class ProactiveChatPlugin implements Plugin {
   }
 
   teardown(): void {
+    // Set before cancelling so an in-flight heartbeat aborts silently.
+    this.#stopped = true;
     this.#ctx?.scheduler.cancelTask(PROACTIVE_CHAT_TASK_NAME);
     this.#queue?.clear();
     this.#emotionStore?.clear();
@@ -108,6 +122,7 @@ export class ProactiveChatPlugin implements Plugin {
 
     const now = this.#nowFn();
     for (const session of ctx.sessions.list()) {
+      if (this.#stopped) return;
       await this.#evaluateSession(ctx, session, now);
     }
   }
@@ -119,46 +134,58 @@ export class ProactiveChatPlugin implements Plugin {
     if (!config || !emotionStore || !queue) return;
     if (!session.messages.some((message) => message.role === 'user')) return;
 
+    // Evolve the in-memory emotion state on every tick — even vetoed ones — so
+    // long-run dynamics (growing socialNeed, decaying arousal) accumulate.
     let emotion: EmotionState = emotionStore.get(session.id);
-    if (config.emotion.useLlmAssessment) {
-      const assessed = await this.#assessEmotion(ctx, session, emotion, now);
-      if (assessed) {
-        emotion = mergeEmotionAssessment(emotion, assessed);
-        emotionStore.set(session.id, emotion);
-      }
-    }
 
     const sends = this.#recentSends(session.id, now);
     const lastSendAt = sends.length > 0 ? sends[sends.length - 1] : undefined;
-    const decision = decide({
-      emotion,
+    const guardrails: GuardrailInput = {
       now,
       lastMessageAt: session.lastActivityAt,
       lastProactiveSendAt: lastSendAt,
       sentThisHour: sends.filter((at) => now - at < ONE_HOUR_MS).length,
       sentToday: sends.filter((at) => now - at < ONE_DAY_MS).length,
       config: config.decision,
-    });
+    };
 
-    if (decision.veto !== null) {
-      this.#emitSkipped(ctx, session.id, decision.veto);
+    // 1. Hard guardrails first: a vetoed tick never spends an LLM call.
+    const veto = evaluateGuardrails(guardrails);
+    if (veto !== null) {
+      this.#emitSkipped(ctx, session.id, veto);
       return;
     }
 
-    // Promote any held candidate whose score has risen far enough.
-    const rescored = queue.rescore(
-      session.id,
-      () => decision.score,
-      config.decision.sendThreshold,
-    );
-    const firstPromoted = rescored.promoted[0];
-    if (firstPromoted) {
-      await this.#deliver(ctx, firstPromoted);
+    // 2. Optional LLM emotion assessment, only once guardrails have passed.
+    if (config.emotion.useLlmAssessment) {
+      const assessed = await this.#assessEmotion(ctx, session, emotion, now);
+      if (this.#stopped) return;
+      if (assessed) {
+        emotion = mergeEmotionAssessment(emotion, assessed);
+        emotionStore.set(session.id, emotion);
+      }
+    }
+
+    const decision = decide({ emotion, ...guardrails });
+
+    // 3. Promote held stubs whose fresh score reached the send threshold. This
+    //    is the only place HOLD-band work spends an LLM call.
+    const rescored = queue.rescore(session.id, () => decision.score, config.decision.sendThreshold);
+    if (rescored.promoted.length > 0) {
+      const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
+      if (this.#stopped) return;
       // Never deliver more than one proactive message per tick.
       for (let i = 1; i < rescored.promoted.length; i += 1) {
         const remaining = rescored.promoted[i];
         if (remaining) queue.enqueue(remaining);
       }
+      if (result === undefined) return;
+      if (result.kind === 'skipped') {
+        // The stub is dropped (already removed by `rescore`).
+        this.#emitSkipped(ctx, session.id, result.reason);
+        return;
+      }
+      await this.#deliver(ctx, result.candidate);
       return;
     }
     if (queue.size(session.id) > 0) return;
@@ -168,12 +195,50 @@ export class ProactiveChatPlugin implements Plugin {
       return;
     }
 
+    if (decision.outcome === 'hold') {
+      // HOLD must stay LLM-free: queue a contentless stub for a later tick.
+      const stub: HeldStub = {
+        sessionId: session.id,
+        enqueuedAt: now,
+        scoreAtEnqueue: decision.score,
+        breakdown: decision.breakdown,
+      };
+      const accepted = queue.enqueue(stub);
+      ctx.eventBus.emit('proactive:held', {
+        sessionId: session.id,
+        score: decision.score,
+        breakdown: decision.breakdown,
+        queueSize: queue.size(session.id),
+        accepted,
+      });
+      return;
+    }
+
+    const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
+    if (this.#stopped) return;
+    if (result === undefined) return;
+    if (result.kind === 'skipped') {
+      this.#emitSkipped(ctx, session.id, result.reason);
+      return;
+    }
+    await this.#deliver(ctx, result.candidate);
+  }
+
+  /** Build a bundle and ask the LLM for content; `undefined` if unbuildable. */
+  async #tryGenerate(
+    ctx: PluginContext,
+    session: Session,
+    emotion: EmotionState,
+    decision: DecisionResult,
+    now: number,
+  ): Promise<ThoughtEngineResult | undefined> {
+    const config = this.#config;
+    if (!config) return undefined;
     const bundle = buildContextBundle(ctx.sessions, session.id, emotion, now, {
       historyTailMessages: config.context.historyTailMessages,
     });
-    if (!bundle) return;
-
-    const result = await generateThought(ctx.llm, {
+    if (!bundle) return undefined;
+    return generateThought(ctx.llm, {
       sessionId: session.id,
       bundle,
       score: decision.score,
@@ -181,29 +246,10 @@ export class ProactiveChatPlugin implements Plugin {
       persona: config.persona,
       now,
     });
-
-    if (result.kind === 'skipped') {
-      this.#emitSkipped(ctx, session.id, result.reason);
-      return;
-    }
-
-    if (decision.outcome === 'generate') {
-      await this.#deliver(ctx, result.candidate);
-      return;
-    }
-
-    const accepted = queue.enqueue(result.candidate);
-    ctx.eventBus.emit('proactive:held', {
-      sessionId: session.id,
-      content: result.candidate.content,
-      score: result.candidate.score,
-      breakdown: result.candidate.breakdown,
-      queueSize: queue.size(session.id),
-      accepted,
-    });
   }
 
   async #deliver(ctx: PluginContext, candidate: ThoughtCandidate): Promise<void> {
+    if (this.#stopped) return;
     await ctx.send(candidate.sessionId, candidate.content);
     const now = this.#nowFn();
     const sends = this.#recentSends(candidate.sessionId, now);
@@ -268,4 +314,3 @@ export function createProactiveChatPlugin(options: ProactiveChatPluginOptions = 
 
 /** Re-exported for consumers that need the default dynamics/state constants. */
 export { DEFAULT_EMOTION_DYNAMICS, DEFAULT_EMOTION_STATE };
-export type { Message };

@@ -12,7 +12,12 @@ export interface LLMConfig {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** Per-request timeout in milliseconds. Defaults to `30_000`. */
+  requestTimeoutMs: number;
 }
+
+/** Default per-request LLM timeout in milliseconds. */
+export const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * Configuration for the built-in proactive-chat plugin.
@@ -67,6 +72,7 @@ export const DEFAULT_PROACTIVE_CHAT: ProactiveChatConfig = {
   emotion: {
     decayRatePerHour: 0.1,
     socialNeedGrowthPerHour: 0.2,
+    arousalFloor: 0.2,
     useLlmAssessment: false,
   },
   context: { historyTailMessages: 20 },
@@ -115,6 +121,12 @@ function stringFrom(source: Record<string, unknown>, key: string, fallback: stri
 function booleanFrom(source: Record<string, unknown>, key: string, fallback: boolean): boolean {
   const value = source[key];
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function timeoutFromEnv(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 }
 
 const CLOCK_PATTERN = /^([01]?\d|2[0-3]):[0-5]\d$/;
@@ -216,6 +228,7 @@ export function resolveProactiveChatConfig(raw: unknown): ProactiveChatConfig {
         'socialNeedGrowthPerHour',
         defaults.emotion.socialNeedGrowthPerHour,
       ),
+      arousalFloor: numberFrom(emotion, 'arousalFloor', defaults.emotion.arousalFloor),
       useLlmAssessment: booleanFrom(
         emotion,
         'useLlmAssessment',
@@ -255,6 +268,7 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
       baseURL: env.LLM_BASE_URL ?? 'https://api.openai.com/v1',
       apiKey: env.LLM_API_KEY ?? '',
       model: env.LLM_MODEL ?? 'gpt-4o-mini',
+      requestTimeoutMs: timeoutFromEnv(env.LLM_REQUEST_TIMEOUT_MS),
     },
     plugins: {
       proactiveChat: { ...DEFAULT_PROACTIVE_CHAT },
@@ -284,8 +298,18 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
   const proactive = isPlainObject(plugins.proactiveChat)
     ? (plugins.proactiveChat as Partial<ProactiveChatConfig>)
     : {};
+  const mergedLlm = isPlainObject(merged.llm) ? merged.llm : {};
   return {
-    llm: { ...defaults.llm, ...(isPlainObject(merged.llm) ? merged.llm : {}) },
+    llm: {
+      ...defaults.llm,
+      ...mergedLlm,
+      // Guarantee the timeout is always a positive number, whatever the file said.
+      requestTimeoutMs: numberFrom(
+        mergedLlm,
+        'requestTimeoutMs',
+        defaults.llm.requestTimeoutMs,
+      ),
+    },
     plugins: {
       ...plugins,
       proactiveChat: { ...DEFAULT_PROACTIVE_CHAT, ...proactive },

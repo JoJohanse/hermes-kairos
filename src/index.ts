@@ -15,6 +15,7 @@ async function main(): Promise<void> {
     baseURL: config.llm.baseURL,
     apiKey: config.llm.apiKey,
     model: config.llm.model,
+    requestTimeoutMs: config.llm.requestTimeoutMs,
   });
 
   const runtime = new HermesRuntime({ config, llm });

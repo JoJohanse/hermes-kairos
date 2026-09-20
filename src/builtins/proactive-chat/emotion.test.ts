@@ -34,21 +34,31 @@ describe('evolveEmotion', () => {
     const evolved = evolveEmotion(
       { valence: 0.5, arousal: 1, socialNeed: 0.5 },
       5 * HOUR,
-      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0 },
+      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0, arousalFloor: 0 },
     );
     expect(evolved.arousal).toBeCloseTo(Math.exp(-0.5));
+  });
+
+  it('decays arousal toward the configured floor and never below it', () => {
+    const config = { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0, arousalFloor: 0.2 };
+    const mid = evolveEmotion({ valence: 0.5, arousal: 1, socialNeed: 0.5 }, 5 * HOUR, config);
+    expect(mid.arousal).toBeCloseTo(0.2 + 0.8 * Math.exp(-0.5));
+
+    const longRun = evolveEmotion({ valence: 0.5, arousal: 1, socialNeed: 0.5 }, 500 * HOUR, config);
+    expect(longRun.arousal).toBeGreaterThanOrEqual(0.2);
+    expect(longRun.arousal).toBeCloseTo(0.2);
   });
 
   it('regresses valence toward the 0.5 baseline from above and below', () => {
     const high = evolveEmotion(
       { valence: 1, arousal: 0.5, socialNeed: 0.5 },
       5 * HOUR,
-      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0 },
+      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0, arousalFloor: 0 },
     );
     const low = evolveEmotion(
       { valence: 0, arousal: 0.5, socialNeed: 0.5 },
       5 * HOUR,
-      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0 },
+      { decayRatePerHour: 0.1, socialNeedGrowthPerHour: 0, arousalFloor: 0 },
     );
     expect(high.valence).toBeCloseTo(0.5 + 0.5 * Math.exp(-0.5));
     expect(low.valence).toBeCloseTo(0.5 - 0.5 * Math.exp(-0.5));

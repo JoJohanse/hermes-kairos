@@ -1,18 +1,20 @@
 /**
- * In-memory delayed queue for HOLD-band thoughts.
+ * In-memory delayed queue for HOLD-band stubs.
  *
- * Held candidates are re-scored on every heartbeat; they are promoted (and
- * removed) once their score reaches the send threshold, and dropped when they
- * expire or when a full queue must make room for a higher-scoring newcomer.
+ * HOLD-band work is queued as a lightweight {@link HeldStub} (no LLM content).
+ * Stubs are re-scored on every heartbeat; once a fresh score reaches the send
+ * threshold the stub is promoted and the plugin generates content. Stubs are
+ * dropped when they expire or when a full queue must make room for a
+ * higher-scoring newcomer.
  */
 
-import type { ThoughtCandidate } from './types.js';
+import type { HeldStub } from './types.js';
 
 /** Options for {@link DelayedQueue}. */
 export interface DelayedQueueOptions {
-  /** Maximum candidates held per session. Defaults to `10`. */
+  /** Maximum stubs held per session. Defaults to `10`. */
   maxSize?: number;
-  /** Age after which a candidate is dropped. Defaults to `4` hours. */
+  /** Age after which a stub is dropped. Defaults to `4` hours. */
   maxAgeHours?: number;
   /** Injectable clock (ms since epoch). Defaults to `Date.now`. */
   now?: () => number;
@@ -20,19 +22,19 @@ export interface DelayedQueueOptions {
 
 /** Outcome of a re-score pass. */
 export interface RescoreResult {
-  /** Candidates whose score reached the threshold; removed from the queue. */
-  promoted: ThoughtCandidate[];
-  /** Candidates dropped because they aged out. */
-  expired: ThoughtCandidate[];
-  /** Candidates still below the threshold; retained. */
-  queued: ThoughtCandidate[];
+  /** Stubs whose score reached the threshold; removed from the queue. */
+  promoted: HeldStub[];
+  /** Stubs dropped because they aged out. */
+  expired: HeldStub[];
+  /** Stubs still below the threshold; retained. */
+  queued: HeldStub[];
 }
 
 const HOUR_MS = 3_600_000;
 
-/** Per-session queue of held {@link ThoughtCandidate}s. */
+/** Per-session queue of held {@link HeldStub}s. */
 export class DelayedQueue {
-  readonly #queues = new Map<string, ThoughtCandidate[]>();
+  readonly #queues = new Map<string, HeldStub[]>();
   readonly #maxSize: number;
   readonly #maxAgeMs: number;
   readonly #now: () => number;
@@ -43,75 +45,75 @@ export class DelayedQueue {
     this.#now = options.now ?? (() => Date.now());
   }
 
-  /** Number of candidates held for a session. */
+  /** Number of stubs held for a session. */
   size(sessionId: string): number {
     return this.#queues.get(sessionId)?.length ?? 0;
   }
 
-  /** Snapshot of the candidates held for a session. */
-  entries(sessionId: string): readonly ThoughtCandidate[] {
+  /** Snapshot of the stubs held for a session. */
+  entries(sessionId: string): readonly HeldStub[] {
     return this.#queues.get(sessionId) ?? [];
   }
 
-  /** Session ids with at least one held candidate. */
+  /** Session ids with at least one held stub. */
   sessions(): string[] {
     return [...this.#queues.keys()];
   }
 
   /**
-   * Attempt to hold a candidate.
+   * Attempt to hold a stub.
    *
-   * Expired candidates are pruned first. If the queue is still full, the
+   * Expired stubs are pruned first. If the queue is still full, the
    * lowest-scoring entry is evicted only when the newcomer outscores it;
    * otherwise the newcomer is rejected.
-   * @returns whether the candidate was accepted.
+   * @returns whether the stub was accepted.
    */
-  enqueue(candidate: ThoughtCandidate): boolean {
+  enqueue(stub: HeldStub): boolean {
     const now = this.#now();
-    const fresh = this.#freshEntries(candidate.sessionId, now);
+    const fresh = this.#freshEntries(stub.sessionId, now);
     if (fresh.length >= this.#maxSize) {
       let lowestIndex = 0;
       for (let i = 1; i < fresh.length; i += 1) {
         const entry = fresh[i];
         const lowest = fresh[lowestIndex];
-        if (entry && lowest && entry.score < lowest.score) lowestIndex = i;
+        if (entry && lowest && entry.scoreAtEnqueue < lowest.scoreAtEnqueue) lowestIndex = i;
       }
       const lowest = fresh[lowestIndex];
-      if (lowest !== undefined && lowest.score >= candidate.score) {
-        this.#store(candidate.sessionId, fresh);
+      if (lowest !== undefined && lowest.scoreAtEnqueue >= stub.scoreAtEnqueue) {
+        this.#store(stub.sessionId, fresh);
         return false;
       }
       fresh.splice(lowestIndex, 1);
     }
-    fresh.push(candidate);
-    this.#store(candidate.sessionId, fresh);
+    fresh.push(stub);
+    this.#store(stub.sessionId, fresh);
     return true;
   }
 
   /**
-   * Re-score every held candidate for a session.
+   * Re-score every held stub for a session.
    *
-   * @param scoreOf Current score for a candidate.
-   * @param sendThreshold Score at or above which a candidate is promoted.
+   * @param scoreOf Current score for a stub.
+   * @param sendThreshold Score at or above which a stub is promoted.
    */
   rescore(
     sessionId: string,
-    scoreOf: (candidate: ThoughtCandidate) => number,
+    scoreOf: (stub: HeldStub) => number,
     sendThreshold: number,
   ): RescoreResult {
     const now = this.#now();
     const held = this.#queues.get(sessionId) ?? [];
-    const promoted: ThoughtCandidate[] = [];
-    const expired: ThoughtCandidate[] = [];
-    const queued: ThoughtCandidate[] = [];
+    const promoted: HeldStub[] = [];
+    const expired: HeldStub[] = [];
+    const queued: HeldStub[] = [];
 
-    for (const candidate of held) {
-      if (now - candidate.createdAt > this.#maxAgeMs) {
-        expired.push(candidate);
+    for (const stub of held) {
+      if (now - stub.enqueuedAt > this.#maxAgeMs) {
+        expired.push(stub);
         continue;
       }
-      const score = scoreOf(candidate);
-      const rescored: ThoughtCandidate = { ...candidate, score };
+      const score = scoreOf(stub);
+      const rescored: HeldStub = { ...stub, scoreAtEnqueue: score };
       if (score >= sendThreshold) promoted.push(rescored);
       else queued.push(rescored);
     }
@@ -120,18 +122,18 @@ export class DelayedQueue {
     return { promoted, expired, queued };
   }
 
-  /** Drop all candidates for one session, or for every session when omitted. */
+  /** Drop all stubs for one session, or for every session when omitted. */
   clear(sessionId?: string): void {
     if (sessionId === undefined) this.#queues.clear();
     else this.#queues.delete(sessionId);
   }
 
-  #freshEntries(sessionId: string, now: number): ThoughtCandidate[] {
+  #freshEntries(sessionId: string, now: number): HeldStub[] {
     const held = this.#queues.get(sessionId) ?? [];
-    return held.filter((candidate) => now - candidate.createdAt <= this.#maxAgeMs);
+    return held.filter((stub) => now - stub.enqueuedAt <= this.#maxAgeMs);
   }
 
-  #store(sessionId: string, entries: ThoughtCandidate[]): void {
+  #store(sessionId: string, entries: HeldStub[]): void {
     if (entries.length === 0) this.#queues.delete(sessionId);
     else this.#queues.set(sessionId, entries);
   }

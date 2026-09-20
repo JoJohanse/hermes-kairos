@@ -26,8 +26,15 @@ hermes-kairos/
 │   │   └── scheduler.ts             # setInterval tasks, skips overlapping runs
 │   └── builtins/
 │       └── proactive-chat/
-│           ├── index.ts             # placeholder plugin (lifecycle only, TODO internals)
-│           └── README.md            # open design questions for the plugin
+│           ├── index.ts             # ProactiveChatPlugin: heartbeat, counters, events
+│           ├── decision.ts          # guardrails + score + banding (pure)
+│           ├── emotion.ts           # time-driven emotion + in-memory store (pure maths)
+│           ├── delayed-queue.ts     # per-session HOLD stub queue (pure)
+│           ├── context.ts           # ContextBundle builder from SessionManager
+│           ├── thought-engine.ts    # prompt construction + SKIP parsing
+│           ├── prompts.ts           # default persona/instruction strings
+│           ├── types.ts             # shared shapes (dependency-free)
+│           └── README.md            # plugin behavior + on-disk/serialized context docs
 ├── package.json
 ├── tsconfig.json
 └── .gitignore
@@ -37,7 +44,7 @@ hermes-kairos/
 
 1. `loadConfig()` resolves LLM settings from env (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`) and merges an optional `hermes.config.json` at the repo root.
 2. `new HermesRuntime({ config, llm })` creates the event bus, session manager, scheduler and plugin registry.
-3. `runtime.register(plugin)` adds plugins (built-in placeholders included).
+3. `runtime.register(plugin)` adds plugins (the built-in proactive-chat plugin is registered by the bootstrap).
 4. `runtime.start()` starts the scheduler, then runs `init(ctx)` for each plugin in order; a throwing plugin is logged and skipped without blocking the rest.
 5. `runtime.stop()` tears plugins down in reverse order and stops the scheduler.
 
@@ -84,7 +91,17 @@ plugin defaults, e.g.:
 
 ```json
 {
-  "llm": { "model": "gpt-4.1-mini" },
-  "plugins": { "proactiveChat": { "enabled": true, "idleThresholdMs": 300000 } }
+  "llm": { "model": "gpt-4.1-mini", "requestTimeoutMs": 30000 },
+  "plugins": {
+    "proactiveChat": {
+      "enabled": true,
+      "decision": { "noSendAfterActivityMinutes": 5 }
+    }
+  }
 }
 ```
+
+Runtime state is intentionally in-memory: sessions/messages, per-session emotion,
+the HOLD stub queue and send counters all reset on restart. See
+[`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md)
+for the full plugin behavior and configuration reference.

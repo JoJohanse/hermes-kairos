@@ -32,7 +32,7 @@ export interface DecisionBreakdown {
   valence: number;
   arousal: number;
   socialNeed: number;
-  /** `(valence + arousal + socialNeed) / 3`. */
+  /** `(valence + arousal + 3 * socialNeed) / 5`. */
   intensity: number;
   /** Fitness of the current local time-of-day window. */
   timeFitness: number;
@@ -46,6 +46,22 @@ export interface DecisionBreakdown {
   sentToday: number;
   /** Product of the four factors above. */
   score: number;
+}
+
+/**
+ * A lightweight HOLD-band placeholder held in the delayed queue.
+ *
+ * Stubs deliberately carry no content: the HOLD band never spends an LLM call.
+ * Content is generated only after a later tick promotes the stub to the send
+ * threshold (see {@link ThoughtCandidate}).
+ */
+export interface HeldStub {
+  sessionId: string;
+  /** Time the stub was first enqueued (ms since epoch). */
+  enqueuedAt: number;
+  /** Most recently observed score (initialized at enqueue, refreshed on re-score). */
+  scoreAtEnqueue: number;
+  breakdown: DecisionBreakdown;
 }
 
 /** A generated, not-yet-sent (or just-sent) proactive thought. */
@@ -92,6 +108,11 @@ export interface ProactiveDecisionConfig {
 export interface ProactiveEmotionConfig {
   decayRatePerHour: number;
   socialNeedGrowthPerHour: number;
+  /**
+   * Floor below which `arousal` never decays, keeping long idle sessions
+   * reachable instead of fading to zero.
+   */
+  arousalFloor: number;
   /** When true, a single LLM assessment call is merged into the evolved state. */
   useLlmAssessment: boolean;
 }
@@ -138,14 +159,18 @@ export interface ProactiveThoughtEvent {
   timestamp: number;
 }
 
-/** Payload for the `proactive:held` event. */
+/**
+ * Payload for the `proactive:held` event.
+ *
+ * No `content` is included: HOLD-band stubs are queued without an LLM call, so
+ * there is nothing generated yet.
+ */
 export interface ProactiveHeldEvent {
   sessionId: string;
-  content: string;
   score: number;
   breakdown: DecisionBreakdown;
   queueSize: number;
-  /** Whether the candidate was accepted into the queue. */
+  /** Whether the stub was accepted into the queue. */
   accepted: boolean;
 }
 
