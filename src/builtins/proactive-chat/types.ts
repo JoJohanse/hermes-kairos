@@ -224,6 +224,42 @@ export interface ProactiveSkippedEvent {
   reason: string;
 }
 
+/** Payload for the `proactive:delegate-failed` event (delegate delivery rejected). */
+export interface ProactiveDelegateFailedEvent {
+  sessionId: string;
+  reason: string;
+}
+
+/** Payload for the `proactive:delivery-failed` event (`self` delivery rejected). */
+export interface ProactiveDeliveryFailedEvent {
+  sessionId: string;
+  reason: string;
+}
+
+/**
+ * Delivery payload handed to a {@link ProactiveDeliveryHandler}.
+ *
+ * `inject` carries the delegate directive (external agent composes the message);
+ * `send` carries plugin-generated content (`self`/verbatim mode). `breakdown` is
+ * intentionally `unknown` so the plugin stays decoupled from transport shapes;
+ * bridge consumers can re-narrow it.
+ */
+export interface ProactiveDeliveryPayload {
+  kind: 'inject' | 'send';
+  sessionId: string;
+  directive?: string;
+  content?: string;
+  score: number;
+  breakdown: unknown;
+}
+
+/**
+ * Awaited delivery transport. The bridge injects one that POSTs to its callback
+ * URL. When it rejects, the plugin surfaces `*-failed` and does **not** record a
+ * send slot, so the next tick can retry.
+ */
+export type ProactiveDeliveryHandler = (payload: ProactiveDeliveryPayload) => Promise<void>;
+
 /** Current schema version for {@link ProactiveChatSnapshot}. */
 export const PROACTIVE_CHAT_SNAPSHOT_VERSION = 1;
 

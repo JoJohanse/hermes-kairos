@@ -20,13 +20,20 @@ import {
   DEFAULT_EMOTION_STATE,
   evolveEmotion,
 } from './emotion.js';
-import { ProactiveChatPlugin, PROACTIVE_CHAT_STATE_NAME } from './index.js';
+import {
+  ProactiveChatPlugin,
+  PROACTIVE_CHAT_STATE_NAME,
+  type ProactiveChatPluginOptions,
+} from './index.js';
 import {
   PROACTIVE_CHAT_SNAPSHOT_VERSION,
   type EmotionState,
   type HeldStub,
   type ProactiveChatSnapshot,
   type ProactiveDelegateEvent,
+  type ProactiveDelegateFailedEvent,
+  type ProactiveDeliveryFailedEvent,
+  type ProactiveDeliveryHandler,
   type ProactiveHeldEvent,
   type ProactiveSkippedEvent,
   type ProactiveThoughtEvent,
@@ -105,6 +112,8 @@ interface BootOptions {
   response?: string;
   /** Reuse a specific data dir (for restart/persistence tests). */
   dataDir?: string;
+  /** Extra plugin options (e.g. a `deliveryHandler`). */
+  pluginOptions?: ProactiveChatPluginOptions;
 }
 
 interface BootResult {
@@ -116,6 +125,8 @@ interface BootResult {
   held: ProactiveHeldEvent[];
   thought: ProactiveThoughtEvent[];
   delegate: ProactiveDelegateEvent[];
+  delegateFailed: ProactiveDelegateFailedEvent[];
+  deliveryFailed: ProactiveDeliveryFailedEvent[];
 }
 
 async function boot(options: BootOptions = {}): Promise<BootResult> {
@@ -125,13 +136,15 @@ async function boot(options: BootOptions = {}): Promise<BootResult> {
     config: runtimeConfig(options.slice ?? pluginSlice(), options.dataDir),
     llm,
   });
-  const plugin = new ProactiveChatPlugin();
+  const plugin = new ProactiveChatPlugin(options.pluginOptions);
   runtime.register(plugin);
   const outbound: Outbound[] = [];
   const skipped: ProactiveSkippedEvent[] = [];
   const held: ProactiveHeldEvent[] = [];
   const thought: ProactiveThoughtEvent[] = [];
   const delegate: ProactiveDelegateEvent[] = [];
+  const delegateFailed: ProactiveDelegateFailedEvent[] = [];
+  const deliveryFailed: ProactiveDeliveryFailedEvent[] = [];
   runtime.eventBus.on('message:outbound', (payload) => outbound.push(payload));
   runtime.eventBus.on('proactive:skipped', (payload) => skipped.push(payload as ProactiveSkippedEvent));
   runtime.eventBus.on('proactive:held', (payload) => held.push(payload as ProactiveHeldEvent));
@@ -139,8 +152,14 @@ async function boot(options: BootOptions = {}): Promise<BootResult> {
   runtime.eventBus.on('proactive:delegate', (payload) =>
     delegate.push(payload as ProactiveDelegateEvent),
   );
+  runtime.eventBus.on('proactive:delegate-failed', (payload) =>
+    delegateFailed.push(payload as ProactiveDelegateFailedEvent),
+  );
+  runtime.eventBus.on('proactive:delivery-failed', (payload) =>
+    deliveryFailed.push(payload as ProactiveDeliveryFailedEvent),
+  );
   await runtime.start();
-  return { runtime, plugin, llm, outbound, skipped, held, thought, delegate };
+  return { runtime, plugin, llm, outbound, skipped, held, thought, delegate, delegateFailed, deliveryFailed };
 }
 
 /** Provider whose completion stays pending until the test resolves it. */
@@ -1068,6 +1087,124 @@ describe('ProactiveChatPlugin (integration)', () => {
 
       expect(outbound).toHaveLength(1);
       expect(outbound[0]?.sessionId).toBe(session.id);
+
+      await runtime.stop();
+    });
+  });
+
+  describe('awaited delivery handler (F6)', () => {
+    it('delegate: a rejecting handler records no send slot and the next tick retries', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0));
+      let attempts = 0;
+      const deliveryHandler: ProactiveDeliveryHandler = async () => {
+        attempts += 1;
+        throw new Error('post failed');
+      };
+      const { runtime, plugin, delegate, delegateFailed } = await boot({
+        slice: pluginSlice({ delivery: { mode: 'delegate' } }),
+        pluginOptions: { deliveryHandler },
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi there');
+
+      // 5 min of silence is the first tick that clears `noSendAfterActivity`.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+      expect(attempts).toBe(1);
+      expect(delegateFailed).toHaveLength(1);
+      expect(delegateFailed[0]?.reason).toBe('post failed');
+      // The event-bus fallback must stay silent when a handler owns delivery.
+      expect(delegate).toHaveLength(0);
+      // No slot recorded → cooldown does not apply → the next eligible tick retries.
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(2);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(0);
+
+      await runtime.stop();
+    });
+
+    it('delegate: a resolving handler records the slot exactly once', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0));
+      let attempts = 0;
+      const deliveryHandler: ProactiveDeliveryHandler = async () => {
+        attempts += 1;
+      };
+      const { runtime, plugin, delegateFailed } = await boot({
+        slice: pluginSlice({ delivery: { mode: 'delegate' } }),
+        pluginOptions: { deliveryHandler },
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi there');
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      expect(attempts).toBe(1);
+      expect(delegateFailed).toHaveLength(0);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(1);
+
+      // Inside the 30-minute cooldown the slot suppresses further delivery.
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      expect(attempts).toBe(1);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(1);
+
+      await runtime.stop();
+    });
+
+    it('self: a rejecting handler emits delivery-failed, skips ctx.send and the slot', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0));
+      let attempts = 0;
+      const deliveryHandler: ProactiveDeliveryHandler = async () => {
+        attempts += 1;
+        throw new Error('transport down');
+      };
+      const { runtime, plugin, outbound, deliveryFailed } = await boot({
+        slice: pluginSlice(),
+        pluginOptions: { deliveryHandler },
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi there');
+
+      // 5 min of silence is the first tick that clears `noSendAfterActivity`.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+      expect(attempts).toBe(1);
+      expect(deliveryFailed).toHaveLength(1);
+      expect(deliveryFailed[0]?.reason).toBe('transport down');
+      expect(outbound).toHaveLength(0);
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(0);
+
+      // The retry path is open again on the next eligible tick.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(2);
+
+      await runtime.stop();
+    });
+
+    it('self: a resolving handler delivers via ctx.send and records the slot once', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0));
+      let attempts = 0;
+      const deliveryHandler: ProactiveDeliveryHandler = async () => {
+        attempts += 1;
+      };
+      const { runtime, plugin, outbound, deliveryFailed } = await boot({
+        slice: pluginSlice(),
+        pluginOptions: { deliveryHandler },
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi there');
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+
+      expect(attempts).toBe(1);
+      expect(deliveryFailed).toHaveLength(0);
+      expect(outbound).toHaveLength(1);
+      expect(outbound[0]?.content).toBe('Hey, long time no chat!');
+      expect(plugin.sendTimestamps(session.id)).toHaveLength(1);
 
       await runtime.stop();
     });

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "description": "KAIROS sidecar <-> hermes-plugin/kairos cross-process contract. Byte-identical mirror: src/hermes-bridge/contract.json.",
+  "transport": {
+    "contentType": "application/json",
+    "contentTypeHeader": "content-type",
+    "maxBodyBytes": 1048576,
+    "unsupportedContentTypeStatus": 415,
+    "payloadTooLargeStatus": 413
+  },
+  "auth": {
+    "header": "authorization",
+    "scheme": "Bearer",
+    "emptyTokenMeansDisabled": true,
+    "exemptRoutes": ["/health"],
+    "disabledTokenLiteral": "none"
+  },
+  "routes": {
+    "health": {"method": "GET", "path": "/health", "source": "plugin", "target": "sidecar"},
+    "events": {"method": "POST", "path": "/events", "source": "plugin", "target": "sidecar"},
+    "speak": {"method": "POST", "path": "/speak", "source": "sidecar", "target": "plugin"}
+  },
+  "nonce": {
+    "perBoot": true,
+    "field": "nonce",
+    "healthRoute": "/health",
+    "handshake": "sidecar generates a fresh random nonce per boot and echoes it from GET /health; the plugin sends --nonce <value> and requires /health.nonce to match"
+  },
+  "sidecarArgv": {
+    "allOptional": true,
+    "flags": ["--port", "--host", "--token", "--callback-url", "--delivery-mode", "--data-dir", "--nonce"]
+  },
+  "speakPayloads": {
+    "inject": {
+      "kind": "inject",
+      "required": ["kind", "sessionId", "directive"],
+      "optional": ["score"],
+      "fieldTypes": {"kind": "string", "sessionId": "string", "directive": "string", "score": "number"}
+    },
+    "send": {
+      "kind": "send",
+      "required": ["kind", "sessionId", "content"],
+      "optional": ["score"],
+      "fieldTypes": {"kind": "string", "sessionId": "string", "content": "string", "score": "number"}
+    }
+  },
+  "eventPayloads": {
+    "user-message": {
+      "type": "user-message",
+      "required": ["type", "sessionId", "content"],
+      "optional": ["ts"],
+      "fieldTypes": {"type": "string", "sessionId": "string", "content": "string", "ts": "number"}
+    },
+    "agent-message": {
+      "type": "agent-message",
+      "required": ["type", "sessionId", "content"],
+      "optional": ["ts"],
+      "fieldTypes": {"type": "string", "sessionId": "string", "content": "string", "ts": "number"}
+    }
+  },
+  "pidfile": "sidecar.pid",
+  "dataDir": {
+    "setting": "dataDir",
+    "envOverride": "HERMES_HOME",
+    "hermesHomeSuffix": "kairos-data",
+    "default": "~/.hermes/kairos-data"
+  }
+}

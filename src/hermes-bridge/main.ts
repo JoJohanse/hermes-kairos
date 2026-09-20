@@ -6,23 +6,43 @@
  * callback URL (`POST {kind:'inject'|'send'}`), and can force an evaluation via
  * `POST /trigger`.
  *
- * Zero runtime dependencies: `node:http` only. The server is created separately
- * from `listen()` and every outbound call goes through an injectable `fetch`, so
+ * Zero runtime dependencies: `node:http`, `node:util.parseArgs` and
+ * `node:crypto.randomUUID` only. The server is created separately from
+ * `listen()` and every outbound call goes through an injectable `fetch`, so
  * tests exercise routes and callbacks without binding real ports.
+ *
+ * Cross-process contract (mirrored by the Python lane's `contract.json`): see
+ * `src/hermes-bridge/contract.json`.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { defaultConfigWarn, loadConfig, type HermesBridgeConfig } from '../config/config.js';
+import {
+  defaultConfigWarn,
+  loadConfig,
+  type HermesBridgeConfig,
+  type HermesBridgeDeliveryMode,
+  type HermesConfig,
+} from '../config/config.js';
 import { HermesRuntime } from '../core/runtime.js';
 import type { MessageRole } from '../core/types.js';
 import { ProactiveChatPlugin } from '../builtins/proactive-chat/index.js';
 import type {
   ProactiveDelegateEvent,
+  ProactiveDeliveryHandler,
+  ProactiveDeliveryPayload,
   ProactiveThoughtEvent,
 } from '../builtins/proactive-chat/types.js';
 import { OpenAICompatibleProvider } from '../llm/openai-compatible.js';
+import {
+  listenWithStalePidRecovery,
+  nodePidFileFs,
+  removePidFile,
+  writePidFile,
+} from './pidfile.js';
 
 /** Minimal trigger surface the bridge needs from the proactive-chat plugin. */
 export interface BridgeTrigger {
@@ -87,6 +107,18 @@ export interface BridgeServerDeps {
   plugin: BridgeTrigger;
   /** Resolved `hermesBridge` config slice. */
   config: HermesBridgeConfig;
+  /**
+   * Boot nonce echoed by `GET /health` and (by the entry point) written to the
+   * pidfile. When omitted, `/health` reports `uptimeMs` instead (test/default
+   * shape) and the nonce handshake is inactive.
+   */
+  nonce?: string;
+  /**
+   * Whether plugin events are forwarded to the callback URL as a fallback.
+   * Defaults to true; the bridge entry sets it to false when a
+   * {@link ProactiveDeliveryHandler} owns delivery (avoiding a double POST).
+   */
+  attachCallbacks?: boolean;
   /** Injectable outbound HTTP (defaults to global `fetch`). */
   fetchImpl?: BridgeFetch;
   /** Injectable logger (defaults to console). */
@@ -115,6 +147,159 @@ type CallbackPayload =
 /** Per-request callback timeout. */
 export const CALLBACK_TIMEOUT_MS = 5_000;
 
+/** Maximum accepted request body (1 MiB); larger requests get `413`. */
+export const MAX_BODY_BYTES = 1_048_576;
+
+/** Signals treated as a graceful stop request (SIGBREAK supports Windows CTRL_BREAK_EVENT). */
+export const BRIDGE_SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const;
+
+/** One parsed sidecar argv flag (all optional; absent → config/default). */
+export interface BridgeArgv {
+  port?: number;
+  host?: string;
+  token?: string;
+  callbackUrl?: string;
+  deliveryMode?: HermesBridgeDeliveryMode;
+  dataDir?: string;
+  nonce?: string;
+  /** True when at least one known bridge flag was present — implies a deliberate sidecar launch. */
+  explicitLaunch?: boolean;
+}
+
+/** Thrown by {@link parseBridgeArgs} for a malformed flag value. */
+export class BridgeArgvError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BridgeArgvError';
+  }
+}
+
+/** CLI value names for {@link parseBridgeArgs}. */
+const ARG_OPTIONS = {
+  port: { type: 'string' },
+  host: { type: 'string' },
+  token: { type: 'string' },
+  'callback-url': { type: 'string' },
+  'delivery-mode': { type: 'string' },
+  'data-dir': { type: 'string' },
+  nonce: { type: 'string' },
+} as const;
+
+function stringArg(values: Record<string, unknown>, key: string): string | undefined {
+  const value = values[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Parse sidecar argv into {@link BridgeArgv}. Only known flags are read; unknown
+ * flags/positionals are ignored so a wrapper can pass extra arguments. Invalid
+ * values (`--port`, `--delivery-mode`) throw {@link BridgeArgvError}.
+ */
+export function parseBridgeArgs(argv: readonly string[]): BridgeArgv {
+  let values: Record<string, unknown>;
+  try {
+    const parsed = parseArgs({
+      args: [...argv],
+      options: ARG_OPTIONS,
+      strict: false,
+      allowPositionals: true,
+    });
+    values = parsed.values as Record<string, unknown>;
+  } catch (error) {
+    throw new BridgeArgvError(
+      `failed to parse sidecar argv: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const result: BridgeArgv = {};
+
+  const port = stringArg(values, 'port');
+  if (port !== undefined) {
+    const parsedPort = Number(port);
+    if (!Number.isInteger(parsedPort) || parsedPort < 0 || parsedPort > 65_535) {
+      throw new BridgeArgvError(`--port must be an integer in 0..65535 (received ${port})`);
+    }
+    result.port = parsedPort;
+  }
+
+  const host = stringArg(values, 'host');
+  if (host !== undefined) result.host = host;
+
+  const token = stringArg(values, 'token');
+  if (token !== undefined) result.token = token;
+
+  const callbackUrl = stringArg(values, 'callback-url');
+  if (callbackUrl !== undefined) result.callbackUrl = callbackUrl;
+
+  const deliveryMode = stringArg(values, 'delivery-mode');
+  if (deliveryMode !== undefined) {
+    if (deliveryMode !== 'turn' && deliveryMode !== 'verbatim') {
+      throw new BridgeArgvError(
+        `--delivery-mode must be 'turn' or 'verbatim' (received ${deliveryMode})`,
+      );
+    }
+    result.deliveryMode = deliveryMode;
+  }
+
+  const dataDir = stringArg(values, 'data-dir');
+  if (dataDir !== undefined) {
+    if (dataDir.trim() === '') throw new BridgeArgvError('--data-dir must be a non-empty path');
+    result.dataDir = dataDir;
+  }
+
+  const nonce = stringArg(values, 'nonce');
+  if (nonce !== undefined) result.nonce = nonce;
+
+  // Any recognized flag implies a deliberate sidecar launch (the hermes plugin
+  // always passes argv), which overrides the config-file `enabled` gate.
+  const flagsPresent = argv.some((token) => {
+    if (!token.startsWith('--')) return false;
+    const name = token.slice(2).split('=')[0];
+    return name !== undefined && Object.prototype.hasOwnProperty.call(ARG_OPTIONS, name);
+  });
+  if (flagsPresent) result.explicitLaunch = true;
+
+  return result;
+}
+
+/** Result of applying argv over a resolved config. */
+export interface ResolvedBridgeArgs {
+  /** Effective bridge config (argv > config file > built-in defaults). */
+  bridge: HermesBridgeConfig;
+  /** Effective data directory (argv `--data-dir` wins over `storage.dataDir`). */
+  dataDir: string;
+  /** Boot nonce (`--nonce`, else generated per boot). */
+  nonce: string;
+}
+
+/**
+ * Apply parsed argv over `config`. Precedence is argv > `hermes.config.json` >
+ * built-in default, and `--data-dir` overrides `storage.dataDir` for both the
+ * pidfile and the runtime snapshots.
+ */
+export function resolveBridgeArgs(
+  config: HermesConfig,
+  args: BridgeArgv,
+  options: { generatedNonce?: string } = {},
+): ResolvedBridgeArgs {
+  const bridge: HermesBridgeConfig = {
+    ...config.hermesBridge,
+    ...(args.port !== undefined ? { port: args.port } : {}),
+    ...(args.host !== undefined ? { host: args.host } : {}),
+    ...(args.token !== undefined ? { token: args.token } : {}),
+    ...(args.callbackUrl !== undefined ? { callbackUrl: args.callbackUrl } : {}),
+    ...(args.deliveryMode !== undefined ? { deliveryMode: args.deliveryMode } : {}),
+    // Explicit sidecar argv (the plugin's launch form) implies enabled: the
+    // launcher's cwd has no hermes.config.json to carry the flag.
+    ...(args.explicitLaunch ? { enabled: true } : {}),
+  };
+  return {
+    bridge,
+    dataDir: args.dataDir ?? config.storage.dataDir,
+    nonce: args.nonce ?? options.generatedNonce ?? randomUUID(),
+  };
+}
+
 interface ResolvedBridgeDeps {
   runtime: HermesRuntime;
   plugin: BridgeTrigger;
@@ -123,6 +308,15 @@ interface ResolvedBridgeDeps {
   logger: BridgeLogger;
   now: () => number;
   startedAt: number;
+  nonce: string | undefined;
+}
+
+/** Outbound callback transport dependencies. */
+interface CallbackSenderDeps {
+  callbackUrl: string;
+  token: string;
+  fetchImpl: BridgeFetch;
+  logger: BridgeLogger;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -178,21 +372,36 @@ function handleEvents(deps: ResolvedBridgeDeps, body: string): BridgeResponse {
   return { status: 202, body: { ok: true } };
 }
 
-/** Core router. Auth applies to every route when a token is configured. */
+/**
+ * Core router.
+ *
+ * Auth applies to every route except `GET /health` (the Python lane's liveness
+ * probe runs before the token is exchanged). When no token is configured, auth
+ * is disabled entirely — the Python lane now generates a token by default and
+ * passes it via `--token`, but standalone users may still opt out by leaving it
+ * empty.
+ */
 async function handleBridgeRequest(
   deps: ResolvedBridgeDeps,
   request: BridgeRequest,
 ): Promise<BridgeResponse> {
-  if (!isAuthorized(deps.config, request)) {
+  const path = request.url.split('?')[0] ?? '/';
+  const isHealth = request.method === 'GET' && path === '/health';
+
+  if (!isHealth && !isAuthorized(deps.config, request)) {
     return { status: 401, body: { error: 'unauthorized' } };
   }
 
-  const path = request.url.split('?')[0] ?? '/';
-  if (request.method === 'GET' && path === '/health') {
-    return {
-      status: 200,
-      body: { ok: true, uptimeMs: Math.max(0, deps.now() - deps.startedAt) },
-    };
+  if (isHealth) {
+    // Contract shape is `{ok, nonce}`; without a configured nonce (in-memory
+    // route tests) fall back to the legacy uptime shape.
+    if (deps.nonce === undefined) {
+      return {
+        status: 200,
+        body: { ok: true, uptimeMs: Math.max(0, deps.now() - deps.startedAt) },
+      };
+    }
+    return { status: 200, body: { ok: true, nonce: deps.nonce } };
   }
   if (request.method === 'POST' && path === '/events') {
     return handleEvents(deps, request.body);
@@ -204,34 +413,74 @@ async function handleBridgeRequest(
   return { status: 404, body: { error: 'not found' } };
 }
 
-/** POST one callback, fire-and-forget with a bounded timeout. Never throws. */
-async function postCallback(deps: ResolvedBridgeDeps, payload: CallbackPayload): Promise<void> {
+/** Narrow a delivery payload to the wire callback shape (drops extra fields). */
+function toCallbackPayload(payload: ProactiveDeliveryPayload): CallbackPayload | undefined {
+  if (payload.kind === 'inject') {
+    if (typeof payload.directive !== 'string' || payload.directive === '') return undefined;
+    return {
+      kind: 'inject',
+      sessionId: payload.sessionId,
+      directive: payload.directive,
+      score: payload.score,
+    };
+  }
+  if (typeof payload.content !== 'string') return undefined;
+  return {
+    kind: 'send',
+    sessionId: payload.sessionId,
+    content: payload.content,
+    score: payload.score,
+  };
+}
+
+/**
+ * POST one callback with a bounded timeout. Throws when the transport fails or
+ * returns a non-2xx status, so an awaited delivery handler can surface failure.
+ */
+async function sendCallback(deps: CallbackSenderDeps, payload: CallbackPayload): Promise<void> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (deps.config.token !== '') headers['authorization'] = `Bearer ${deps.config.token}`;
+  if (deps.token !== '') headers['authorization'] = `Bearer ${deps.token}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CALLBACK_TIMEOUT_MS);
   timer.unref?.();
   try {
-    const response = await deps.fetchImpl(deps.config.callbackUrl, {
+    const response = await deps.fetchImpl(deps.callbackUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
     if (!response.ok) {
-      deps.logger.warn(
-        `[hermes-bridge] callback (${payload.kind}) returned status ${response.status}`,
-      );
+      throw new Error(`callback (${payload.kind}) returned status ${response.status}`);
     }
-  } catch (error) {
-    deps.logger.warn(`[hermes-bridge] callback (${payload.kind}) failed:`, error);
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** Subscribe to plugin events and forward them to the callback URL. */
+/** Fire-and-forget callback wrapper used by the event-bus fallback. Never throws. */
+async function postCallback(deps: ResolvedBridgeDeps, payload: CallbackPayload): Promise<void> {
+  try {
+    await sendCallback(
+      {
+        callbackUrl: deps.config.callbackUrl,
+        token: deps.config.token,
+        fetchImpl: deps.fetchImpl,
+        logger: deps.logger,
+      },
+      payload,
+    );
+  } catch (error) {
+    deps.logger.warn(`[hermes-bridge] callback (${payload.kind}) failed:`, error);
+  }
+}
+
+/**
+ * Subscribe to plugin events and forward them to the callback URL. This is the
+ * non-bridge fallback path; the bridge entry disables it and passes a
+ * {@link ProactiveDeliveryHandler} to the plugin instead.
+ */
 function attachCallbacks(deps: ResolvedBridgeDeps): () => void {
   const unsubDelegate = deps.runtime.eventBus.on('proactive:delegate', (payload) => {
     const event = payload as Partial<ProactiveDelegateEvent>;
@@ -259,12 +508,45 @@ function attachCallbacks(deps: ResolvedBridgeDeps): () => void {
   };
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+/** Raised internally when a request body exceeds {@link MAX_BODY_BYTES}. */
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super('payload too large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+/** Read the request body, rejecting as soon as it exceeds `maxBytes`. */
+async function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req as AsyncIterable<Buffer | string>) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    total += buffer.length;
+    if (total > maxBytes) throw new PayloadTooLargeError();
+    chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/** Header value as a single string, or `undefined`. */
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === 'string' ? raw : undefined;
+}
+
+/** Whether a `content-type` value is JSON (`application/json...`). */
+function isJsonContentType(value: string | string[] | undefined): boolean {
+  const raw = singleHeader(value);
+  return typeof raw === 'string' && raw.trim().toLowerCase().startsWith('application/json');
+}
+
+/** Declared `Content-Length`, when finite and non-negative. */
+function contentLengthOf(headers: IncomingMessage['headers']): number | undefined {
+  const raw = singleHeader(headers['content-length']);
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -274,8 +556,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /**
- * Build the bridge: subscribes to plugin callbacks and creates (but does not
- * bind) the HTTP server. Call {@link BridgeServer.listen} to bind.
+ * Build the bridge: subscribes to plugin callbacks (unless disabled) and creates
+ * (but does not bind) the HTTP server. Call {@link BridgeServer.listen} to bind.
  */
 export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
   const logger = deps.logger ?? consoleBridgeLogger;
@@ -288,24 +570,57 @@ export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
     logger,
     now,
     startedAt: now(),
+    nonce: deps.nonce,
   };
 
-  const detach = attachCallbacks(resolved);
+  const detach = deps.attachCallbacks === false ? () => {} : attachCallbacks(resolved);
 
   const server = createServer((req, res) => {
+    // Aborted/reset connections must never surface as unhandled 'error' events.
+    req.on('error', () => {});
+    res.on('error', () => {});
     void (async () => {
+      const method = req.method ?? 'GET';
+      const url = req.url ?? '/';
+      const path = url.split('?')[0] ?? '/';
+      const request: BridgeRequest = { method, url, headers: req.headers, body: '' };
+      const isHealth = method === 'GET' && path === '/health';
+      const isJsonRoute = method === 'POST' && (path === '/events' || path === '/trigger');
       try {
-        const body = await readBody(req);
-        const response = await handleBridgeRequest(resolved, {
-          method: req.method ?? 'GET',
-          url: req.url ?? '/',
-          headers: req.headers,
-          body,
-        });
+        // Auth first, then media-type, then size: a failed auth is 401 even when
+        // the content-type is also wrong.
+        if (!isHealth && !isAuthorized(resolved.config, request)) {
+          req.resume();
+          sendJson(res, 401, { error: 'unauthorized' });
+          return;
+        }
+        if (isJsonRoute && !isJsonContentType(req.headers['content-type'])) {
+          req.resume();
+          sendJson(res, 415, { error: 'content-type must be application/json' });
+          return;
+        }
+        const declared = contentLengthOf(req.headers);
+        if (declared !== undefined && declared > MAX_BODY_BYTES) {
+          req.resume();
+          sendJson(res, 413, { error: 'payload too large' });
+          return;
+        }
+        const body = await readBody(req, MAX_BODY_BYTES);
+        const response = await handleBridgeRequest(resolved, { ...request, body });
         sendJson(res, response.status, response.body);
       } catch (error) {
+        if (error instanceof PayloadTooLargeError) {
+          req.resume();
+          // The client may already be gone; only write when the response is usable.
+          if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            sendJson(res, 413, { error: 'payload too large' });
+          }
+          return;
+        }
         logger.error('[hermes-bridge] request failed:', error);
-        sendJson(res, 500, { error: 'internal error' });
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+          sendJson(res, 500, { error: 'internal error' });
+        }
       }
     })();
   });
@@ -340,13 +655,15 @@ export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
 }
 
 /**
- * Bridge entry point. Requires `hermesBridge.enabled`; exits with status 1
- * otherwise. Starts the runtime, then the HTTP server, then waits for a signal.
+ * Bridge entry point. Applies argv over `hermes.config.json`, requires
+ * `hermesBridge.enabled`, starts the runtime, binds the HTTP server (recovering
+ * once from a live stale sidecar), writes the pidfile, then waits for a signal.
  */
-async function main(): Promise<void> {
+export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const onWarn = defaultConfigWarn;
   const config = loadConfig({ onWarn });
-  const bridge = config.hermesBridge;
+  const args = parseBridgeArgs(argv);
+  const { bridge, dataDir, nonce } = resolveBridgeArgs(config, args);
 
   if (!bridge.enabled) {
     console.error(
@@ -366,6 +683,8 @@ async function main(): Promise<void> {
   const runtime = new HermesRuntime({
     config: {
       ...config,
+      // `--data-dir` must move snapshots too, not just the pidfile.
+      storage: { dataDir },
       plugins: {
         ...config.plugins,
         proactiveChat: {
@@ -376,15 +695,57 @@ async function main(): Promise<void> {
     },
     llm,
   });
-  const plugin = new ProactiveChatPlugin({ onWarn });
+
+  // Awaited delivery transport: the plugin only records a send slot after the
+  // callback POST succeeds, so the Python lane can retry failed outreach.
+  const deliveryHandler: ProactiveDeliveryHandler = async (payload) => {
+    const callback = toCallbackPayload(payload);
+    if (!callback) {
+      throw new Error(`unsupported delivery payload for kind ${payload.kind}`);
+    }
+    await sendCallback(
+      {
+        callbackUrl: bridge.callbackUrl,
+        token: bridge.token,
+        fetchImpl: defaultBridgeFetch,
+        logger: consoleBridgeLogger,
+      },
+      callback,
+    );
+  };
+
+  const plugin = new ProactiveChatPlugin({ onWarn, deliveryHandler });
   runtime.register(plugin);
 
   await runtime.start();
 
-  const server = createBridgeServer({ runtime, plugin, config: bridge });
-  await server.listen();
+  const server = createBridgeServer({
+    runtime,
+    plugin,
+    config: bridge,
+    nonce,
+    attachCallbacks: false,
+  });
+
+  try {
+    await listenWithStalePidRecovery(server, { dataDir, logger: consoleBridgeLogger });
+  } catch (error) {
+    console.error('[hermes-bridge] failed to bind:', error);
+    try {
+      await runtime.stop();
+    } catch (stopError) {
+      console.error('[hermes-bridge] shutdown error:', stopError);
+    }
+    process.exit(1);
+  }
+
+  try {
+    writePidFile(nodePidFileFs, dataDir, { pid: process.pid, nonce });
+  } catch (error) {
+    console.error('[hermes-bridge] failed to write pidfile:', error);
+  }
   console.log(
-    `[hermes-bridge] listening on http://${bridge.host}:${bridge.port} (delivery=${deliveryMode})`,
+    `[hermes-bridge] listening on http://${bridge.host}:${bridge.port} (delivery=${deliveryMode}, nonce=${nonce})`,
   );
 
   let shuttingDown = false;
@@ -404,14 +765,18 @@ async function main(): Promise<void> {
       console.error('[hermes-bridge] shutdown error:', error);
       process.exitCode = 1;
     }
+    removePidFile(nodePidFileFs, dataDir);
   };
 
-  process.on('SIGINT', (signal) => {
-    void shutdown(signal);
-  });
-  process.on('SIGTERM', (signal) => {
-    void shutdown(signal);
-  });
+  for (const signal of BRIDGE_SHUTDOWN_SIGNALS) {
+    try {
+      process.on(signal, () => {
+        void shutdown(signal);
+      });
+    } catch {
+      // A platform that does not support this signal (e.g. SIGBREAK off Windows).
+    }
+  }
 }
 
 // Only auto-boot when executed directly, so tests can import the factory.

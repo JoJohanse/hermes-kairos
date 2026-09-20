@@ -37,7 +37,9 @@ import {
   type EmotionState,
   type HeldStub,
   type ProactiveChatSnapshot,
+  type ProactiveDeliveryHandler,
   type ProactiveDeliveryMode,
+  type ProactiveDeliveryPayload,
   type ProactivePersistedSession,
   type ThoughtCandidate,
 } from './types.js';
@@ -122,6 +124,15 @@ export interface ProactiveChatPluginOptions {
    * the shared `console.warn`-based {@link ConfigWarnHandler}.
    */
   onWarn?: ConfigWarnHandler;
+  /**
+   * Optional awaited delivery transport (the HTTP bridge supplies one that POSTs
+   * to its callback URL). When present, the plugin awaits it *before* recording
+   * a send slot; a rejection emits `proactive:delegate-failed` /
+   * `proactive:delivery-failed` and skips the slot so a later tick can retry.
+   * When absent, behavior is exactly the event-bus fallback used by non-bridge
+   * deployments.
+   */
+  deliveryHandler?: ProactiveDeliveryHandler;
 }
 
 /**
@@ -150,10 +161,12 @@ export class ProactiveChatPlugin implements Plugin {
   readonly #sends = new Map<string, number[]>();
   readonly #nowFn: () => number;
   readonly #onWarn: ConfigWarnHandler | undefined;
+  readonly #deliveryHandler: ProactiveDeliveryHandler | undefined;
 
   constructor(options: ProactiveChatPluginOptions = {}) {
     this.#nowFn = options.now ?? (() => Date.now());
     this.#onWarn = options.onWarn;
+    this.#deliveryHandler = options.deliveryHandler;
   }
 
   /** PluginContext captured at init; `undefined` before init / after teardown. */
@@ -452,12 +465,38 @@ export class ProactiveChatPlugin implements Plugin {
       lastContactAt: session.lastActivityAt,
       now,
     });
-    ctx.eventBus.emit('proactive:delegate', {
-      sessionId: session.id,
-      directive,
-      score: decision.score,
-      breakdown: decision.breakdown,
-    });
+
+    if (this.#deliveryHandler) {
+      // Awaited transport: only record the send slot once delivery succeeded, so
+      // a failed POST leaves cooldown/cap state untouched and the next tick
+      // retries instead of silently dropping the outreach.
+      const payload: ProactiveDeliveryPayload = {
+        kind: 'inject',
+        sessionId: session.id,
+        directive,
+        score: decision.score,
+        breakdown: decision.breakdown,
+      };
+      try {
+        await this.#deliveryHandler(payload);
+      } catch (error) {
+        ctx.eventBus.emit('proactive:delegate-failed', {
+          sessionId: session.id,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      if (this.#stopped) return;
+    } else {
+      // Event-bus fallback for non-bridge deployments.
+      ctx.eventBus.emit('proactive:delegate', {
+        sessionId: session.id,
+        directive,
+        score: decision.score,
+        breakdown: decision.breakdown,
+      });
+    }
+
     const sends = this.#recentSends(session.id, now);
     sends.push(now);
     this.#sends.set(session.id, sends);
@@ -490,6 +529,27 @@ export class ProactiveChatPlugin implements Plugin {
 
   async #deliver(ctx: PluginContext, candidate: ThoughtCandidate): Promise<void> {
     if (this.#stopped) return;
+    if (this.#deliveryHandler) {
+      // `self`/verbatim bridge delivery: await the outbound transport first so a
+      // rejection skips the send slot (and the local `ctx.send`) entirely.
+      const payload: ProactiveDeliveryPayload = {
+        kind: 'send',
+        sessionId: candidate.sessionId,
+        content: candidate.content,
+        score: candidate.score,
+        breakdown: candidate.breakdown,
+      };
+      try {
+        await this.#deliveryHandler(payload);
+      } catch (error) {
+        ctx.eventBus.emit('proactive:delivery-failed', {
+          sessionId: candidate.sessionId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      if (this.#stopped) return;
+    }
     await ctx.send(candidate.sessionId, candidate.content);
     const now = this.#nowFn();
     const sends = this.#recentSends(candidate.sessionId, now);
