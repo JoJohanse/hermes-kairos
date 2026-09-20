@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_PROACTIVE_CHAT } from '../../config/config.js';
+import { DEFAULT_PROACTIVE_CHAT } from './config.js';
 import {
   decide,
   evaluateGuardrails,

@@ -81,6 +81,12 @@ export interface UserMessageCouplingConfig {
   interactionSocialNeedReset: number;
 }
 
+/** Default `arousal` boost applied when the user messages the agent. */
+export const DEFAULT_USER_MESSAGE_AROUSAL_BUMP = 0.3;
+
+/** Default `socialNeed` cap applied when the user messages the agent. */
+export const DEFAULT_INTERACTION_SOCIAL_NEED_RESET = 0.1;
+
 /**
  * Apply the "user just messaged us" coupling to an already-evolved state.
  *

@@ -25,16 +25,18 @@
 ## proactive-chat plugin (src/builtins/proactive-chat/ — full reference in its README.md)
 
 - Two-stage gate per heartbeat: guardrail vetoes first (quiet hours = **server-local timezone**, wraps midnight; cooldown; hourly/daily caps; recent-activity) → deterministic score → only then the LLM. A vetoed tick must make **zero** LLM calls (pinned by tests)
+- The per-session pipeline (vetoes → assessment → decision → hold/promote/deliver) lives in `heartbeat.ts` behind one `tick(session, now)` interface with injected deps — its ordering invariants (veto ⇒ zero LLM calls, HOLD stays LLM-free, one delivery per tick with mode-specific extras re-enqueue, re-read emotion after the assessment await) are pinned in `heartbeat.test.ts` without booting the runtime. `plugin.test.ts` stays untouched as the wiring-level oracle — keep it green
 - HOLD band queues contentless stubs; the LLM generates content only on promotion. Never generate at enqueue time
-- Emotion defaults are calibrated: long-run score ceiling 0.666 vs `sendThreshold` 0.6, pinned by a 48h default-threshold e2e test. Changing `DEFAULT_EMOTION_STATE`, decay constants, or the intensity formula can silently kill the feature — keep that test green
+- Emotion defaults are calibrated: long-run score ceiling 0.666 vs `sendThreshold` 0.6, pinned by a 48h default-threshold e2e test. Changing `DEFAULT_EMOTION_STATE`, the dynamics constants (single production copy: `emotion.ts`), or the intensity formula can silently kill the feature — keep that test green
 - Plugin state persists to `<storage.dataDir>/proactive-chat.json` (default `.hermes-data/`, git-ignored): snapshots prune to live sessions, corrupt files → warn + fresh start, `persistence.enabled: false` opts out. Kernel sessions/messages are in-memory only
 - Re-init must be idempotent: clear stale counters and unsubscribe before re-subscribing
 
 ## Config
 
 - Env: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`; optional root `hermes.config.json` deep-merges over defaults
-- Invalid fields never throw — they warn via injectable `onWarn` (default `[config]` console.warn) and fall back to defaults. New config fields must get the same instrumentation, and `config.test.ts` must assert both "warning fires on bad input" and "zero warnings on valid config"
-- Deprecated fields (`checkIntervalMs`, `idleThresholdMs`, `maxInitiationsPerHour`) still map to their replacements when the replacements are absent
+- Ownership: kernel `loadConfig` resolves llm/storage/hermesBridge but passes `plugins.proactiveChat` through as **raw user data** — the plugin owns its slice: defaults + one resolution pass live in `src/builtins/proactive-chat/config.ts` and run at plugin init. `src/config/` must not import from `src/builtins/`; shared field/warning helpers live in `src/config/fields.ts`
+- Invalid fields never throw — they warn via injectable `onWarn` (default `[config]` console.warn) and fall back to defaults. New config fields must get the same instrumentation, and the owning resolver's test file must assert both "warning fires on bad input" and "zero warnings on valid config" (kernel resolvers: `src/config/config.test.ts`; plugin resolver: `src/builtins/proactive-chat/config.test.ts`)
+- Deprecated fields (`checkIntervalMs`, `idleThresholdMs`, `maxInitiationsPerHour`) still map to their replacements when the replacements are absent — since the resolver sees only user data, a file-set deprecated field is honored (not masked by injected defaults)
 
 ## Testing conventions
 

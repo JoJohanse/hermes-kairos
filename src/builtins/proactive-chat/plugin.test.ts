@@ -12,7 +12,7 @@ import { MockProvider } from '../../llm/mock.js';
 import type { CompletionRequest, CompletionResult, LLMProvider } from '../../llm/types.js';
 import type { PluginContext } from '../../plugins/types.js';
 import { Scheduler } from '../../scheduler/scheduler.js';
-import { resolveProactiveChatConfig } from '../../config/config.js';
+import { resolveProactiveChatConfig } from './config.js';
 import { decide } from './decision.js';
 import {
   applyUserMessageCoupling,

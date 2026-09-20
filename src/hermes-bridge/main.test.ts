@@ -23,7 +23,12 @@ import {
 } from './main.js';
 
 const RUNTIME_CONFIG = {
-  llm: { baseURL: 'http://localhost:0/v1', apiKey: '', model: 'mock' },
+  llm: {
+    baseURL: 'http://localhost:0/v1',
+    apiKey: '',
+    model: 'mock',
+    requestTimeoutMs: 30_000,
+  },
   storage: { dataDir: 'bridge-test-data' },
   plugins: { proactiveChat: { enabled: false } },
 };

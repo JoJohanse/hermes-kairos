@@ -266,12 +266,13 @@ to restore.
 }
 ```
 
-`resolveProactiveChatConfig` defensively fills every field and also honors the
-deprecated placeholders (`checkIntervalMs`, `idleThresholdMs`,
+`config.ts` owns this slice end-to-end: `resolveProactiveChatConfig` runs once
+at plugin init over the raw user slice from `hermes.config.json` (the kernel
+never injects plugin defaults). It defensively fills every field and also honors
+the deprecated placeholders (`checkIntervalMs`, `idleThresholdMs`,
 `maxInitiationsPerHour`) when their replacements are absent. Malformed fields
 are replaced by defaults and reported through an optional `onWarn` callback
-(`loadConfig`/`resolveProactiveChatConfig`; defaults to `console.warn` with a
-`[config]` prefix).
+(defaults to `console.warn` with a `[config]` prefix).
 
 ## Module layout
 
@@ -279,13 +280,15 @@ are replaced by defaults and reported through an optional `onWarn` callback
 | --- | --- |
 | `types.ts` | Shared shapes (pure, dependency-free) |
 | `prompts.ts` | Default prompt/persona string constants |
+| `config.ts` | `DEFAULT_PROACTIVE_CHAT` + `resolveProactiveChatConfig`: the plugin owns its config slice |
 | `emotion.ts` | Emotion maths + in-memory store (incl. user-message coupling, pure) |
 | `decision.ts` | Guardrails + scoring + banding (pure) |
 | `delegate.ts` | Delegate-mode directive template (pure) |
 | `delayed-queue.ts` | Per-session HOLD stub queue with re-score/expiry/eviction/restore |
 | `context.ts` | `ContextBundle` builder from `SessionManager` |
 | `thought-engine.ts` | Prompt construction, `SKIP` parsing, candidate creation |
-| `index.ts` | `ProactiveChatPlugin`: config, heartbeat, counters, coupling, persistence, events |
+| `heartbeat.ts` | One session tick: vetoes → assessment → decision → hold/promote/deliver |
+| `index.ts` | `ProactiveChatPlugin`: lifecycle, config resolution, message coupling, scheduler + reentrancy guard, persistence, wiring |
 
 Deterministic modules (`decision`, `emotion`, `delayed-queue`) never import
 runtime singletons — all state and clocks are passed in.

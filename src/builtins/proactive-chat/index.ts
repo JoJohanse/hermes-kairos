@@ -1,24 +1,15 @@
 import type { Unsubscribe } from '../../core/event-bus.js';
 import type { JsonStore, JsonStoreReadResult } from '../../core/storage.js';
-import type { Message, Session } from '../../core/types.js';
-import type { LLMProvider } from '../../llm/types.js';
+import type { Message } from '../../core/types.js';
 import type { Plugin, PluginContext } from '../../plugins/types.js';
 import {
   resolveProactiveChatConfig,
   type ConfigWarnHandler,
   type ProactiveChatConfig,
-} from '../../config/config.js';
-import { buildContextBundle, type ContextBundle } from './context.js';
-import {
-  decide,
-  evaluateGuardrails,
-  ONE_DAY_MS,
-  ONE_HOUR_MS,
-  type DecisionResult,
-  type GuardrailInput,
-} from './decision.js';
+} from './config.js';
+import { buildContextBundle } from './context.js';
+import { ONE_DAY_MS } from './decision.js';
 import { DelayedQueue } from './delayed-queue.js';
-import { buildDelegateDirective } from './delegate.js';
 import {
   applyUserMessageCoupling,
   clamp01,
@@ -26,22 +17,16 @@ import {
   DEFAULT_EMOTION_STATE,
   EmotionStore,
   evolveEmotion,
-  mergeEmotionAssessment,
-  parseEmotionAssessment,
   type EmotionDynamicsConfig,
 } from './emotion.js';
-import { EMOTION_ASSESSMENT_INSTRUCTION } from './prompts.js';
-import { generateThought, serializeContext, type ThoughtEngineResult } from './thought-engine.js';
+import { Heartbeat } from './heartbeat.js';
 import {
   PROACTIVE_CHAT_SNAPSHOT_VERSION,
   type EmotionState,
   type HeldStub,
   type ProactiveChatSnapshot,
   type ProactiveDeliveryHandler,
-  type ProactiveDeliveryMode,
-  type ProactiveDeliveryPayload,
   type ProactivePersistedSession,
-  type ThoughtCandidate,
 } from './types.js';
 
 /** Plugin name used for config lookup and registry identity. */
@@ -153,6 +138,7 @@ export class ProactiveChatPlugin implements Plugin {
   #config: ProactiveChatConfig | undefined;
   #emotionStore: EmotionStore | undefined;
   #queue: DelayedQueue | undefined;
+  #heartbeatModule: Heartbeat | undefined;
   #storage: JsonStore | undefined;
   #unsubscribeMessage: Unsubscribe | undefined;
   #heartbeatTicks = 0;
@@ -236,6 +222,38 @@ export class ProactiveChatPlugin implements Plugin {
       now: this.#nowFn,
     });
 
+    // The per-session pipeline lives in its own deep module; the plugin supplies
+    // the adapters (clock, stores, outbound send, event bus, persistence, stop
+    // flag) and keeps the lifecycle/scheduling concerns.
+    const emotionStore = this.#emotionStore;
+    const queue = this.#queue;
+    this.#heartbeatModule = new Heartbeat({
+      config,
+      now: this.#nowFn,
+      emotion: emotionStore,
+      queue,
+      sends: {
+        recent: (sessionId, atMs) => this.#recentSends(sessionId, atMs),
+        record: (sessionId, atMs) => {
+          const sends = this.#recentSends(sessionId, atMs);
+          sends.push(atMs);
+          this.#sends.set(sessionId, sends);
+        },
+      },
+      llm: ctx.llm,
+      bundle: (sessionId, emotion, atMs) =>
+        buildContextBundle(ctx.sessions, sessionId, emotion, atMs, {
+          historyTailMessages: config.context.historyTailMessages,
+        }),
+      send: (sessionId, content) => ctx.send(sessionId, content),
+      emit: (topic, payload) => {
+        ctx.eventBus.emit(topic, payload);
+      },
+      deliveryHandler: this.#deliveryHandler,
+      persist: () => this.#save(),
+      isStopped: () => this.#stopped,
+    });
+
     if (config.persistence.enabled) this.#restore(dynamics);
 
     // User messages signal presence: excitement rises while the urge to reach
@@ -261,6 +279,7 @@ export class ProactiveChatPlugin implements Plugin {
     if (this.#config?.persistence.enabled) this.#save();
     this.#queue?.clear();
     this.#emotionStore?.clear();
+    this.#heartbeatModule = undefined;
     this.#sends.clear();
     this.#ctx = undefined;
     this.#config = undefined;
@@ -311,288 +330,13 @@ export class ProactiveChatPlugin implements Plugin {
     const now = this.#nowFn();
     for (const session of ctx.sessions.list()) {
       if (this.#stopped) return;
-      await this.#evaluateSession(ctx, session, now);
+      await this.#heartbeatModule?.tick(session, now);
     }
 
     this.#heartbeatTicks += 1;
     const interval = config.persistence.saveIntervalTicks;
     if (config.persistence.enabled && interval > 0 && this.#heartbeatTicks % interval === 0) {
       this.#save();
-    }
-  }
-
-  async #evaluateSession(ctx: PluginContext, session: Session, now: number): Promise<void> {
-    const config = this.#config;
-    const emotionStore = this.#emotionStore;
-    const queue = this.#queue;
-    if (!config || !emotionStore || !queue) return;
-    if (!session.messages.some((message) => message.role === 'user')) return;
-
-    // Evolve the in-memory emotion state on every tick — even vetoed ones — so
-    // long-run dynamics (growing socialNeed, decaying arousal) accumulate.
-    let emotion: EmotionState = emotionStore.get(session.id);
-
-    const sends = this.#recentSends(session.id, now);
-    const lastSendAt = sends.length > 0 ? sends[sends.length - 1] : undefined;
-    const guardrails: GuardrailInput = {
-      now,
-      lastMessageAt: session.lastActivityAt,
-      lastProactiveSendAt: lastSendAt,
-      sentThisHour: sends.filter((at) => now - at < ONE_HOUR_MS).length,
-      sentToday: sends.filter((at) => now - at < ONE_DAY_MS).length,
-      config: config.decision,
-    };
-
-    // 1. Hard guardrails first: a vetoed tick never spends an LLM call.
-    const veto = evaluateGuardrails(guardrails);
-    if (veto !== null) {
-      this.#emitSkipped(ctx, session.id, veto);
-      return;
-    }
-
-    // 2. Optional LLM emotion assessment, only once guardrails have passed.
-    if (config.emotion.useLlmAssessment) {
-      const assessed = await this.#assessEmotion(ctx, session, emotion, now);
-      if (this.#stopped) return;
-      if (assessed) {
-        // The user may have messaged while the assessment was in flight, and
-        // the message handler couples the *current* stored state. Re-read it so
-        // the merge builds on that fresh state instead of the stale pre-await
-        // snapshot, which would otherwise clobber the coupling.
-        const current = emotionStore.get(session.id);
-        emotion = mergeEmotionAssessment(current, assessed);
-        emotionStore.set(session.id, emotion);
-      }
-    }
-
-    const decision = decide({ emotion, ...guardrails });
-
-    // 3. Promote held stubs whose fresh score reached the send threshold. This
-    //    is the only place HOLD-band work spends an LLM call.
-    const rescored = queue.rescore(session.id, () => decision.score, config.decision.sendThreshold);
-    if (rescored.promoted.length > 0) {
-      if (this.#deliveryMode() === 'delegate') {
-        // Never deliver more than one proactive message per tick.
-        for (let i = 1; i < rescored.promoted.length; i += 1) {
-          const remaining = rescored.promoted[i];
-          if (remaining) queue.enqueue(remaining);
-        }
-        await this.#delegate(ctx, session, emotion, decision, now);
-        return;
-      }
-      const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
-      if (this.#stopped) return;
-      // Never deliver more than one proactive message per tick.
-      for (let i = 1; i < rescored.promoted.length; i += 1) {
-        const remaining = rescored.promoted[i];
-        if (remaining) queue.enqueue(remaining);
-      }
-      if (result === undefined) return;
-      if (result.kind === 'skipped') {
-        // The stub is dropped (already removed by `rescore`).
-        this.#emitSkipped(ctx, session.id, result.reason);
-        return;
-      }
-      await this.#deliver(ctx, result.candidate);
-      return;
-    }
-    if (queue.size(session.id) > 0) return;
-
-    if (decision.outcome === 'skip') {
-      this.#emitSkipped(ctx, session.id, 'below_threshold');
-      return;
-    }
-
-    if (decision.outcome === 'hold') {
-      // HOLD must stay LLM-free: queue a contentless stub for a later tick.
-      const stub: HeldStub = {
-        sessionId: session.id,
-        enqueuedAt: now,
-        scoreAtEnqueue: decision.score,
-        breakdown: decision.breakdown,
-      };
-      const accepted = queue.enqueue(stub);
-      ctx.eventBus.emit('proactive:held', {
-        sessionId: session.id,
-        score: decision.score,
-        breakdown: decision.breakdown,
-        queueSize: queue.size(session.id),
-        accepted,
-      });
-      return;
-    }
-
-    if (this.#deliveryMode() === 'delegate') {
-      await this.#delegate(ctx, session, emotion, decision, now);
-      return;
-    }
-
-    const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
-    if (this.#stopped) return;
-    if (result === undefined) return;
-    if (result.kind === 'skipped') {
-      this.#emitSkipped(ctx, session.id, result.reason);
-      return;
-    }
-    await this.#deliver(ctx, result.candidate);
-  }
-
-  /** Configured delivery mode (`self` when uninitialized). */
-  #deliveryMode(): ProactiveDeliveryMode {
-    return this.#config?.delivery.mode ?? 'self';
-  }
-
-  /**
-   * Delegate delivery: emit a plain-template directive for an external agent
-   * instead of calling the thought engine and `ctx.send`.
-   *
-   * The outreach still consumes a send slot (timestamp recorded, snapshot saved)
-   * so cooldown and hourly/daily caps apply exactly as they do in `self` mode.
-   */
-  async #delegate(
-    ctx: PluginContext,
-    session: Session,
-    emotion: EmotionState,
-    decision: DecisionResult,
-    now: number,
-  ): Promise<void> {
-    if (this.#stopped) return;
-    const directive = buildDelegateDirective({
-      sessionId: session.id,
-      emotion,
-      score: decision.score,
-      breakdown: decision.breakdown,
-      lastContactAt: session.lastActivityAt,
-      now,
-    });
-
-    if (this.#deliveryHandler) {
-      // Awaited transport: only record the send slot once delivery succeeded, so
-      // a failed POST leaves cooldown/cap state untouched and the next tick
-      // retries instead of silently dropping the outreach.
-      const payload: ProactiveDeliveryPayload = {
-        kind: 'inject',
-        sessionId: session.id,
-        directive,
-        score: decision.score,
-        breakdown: decision.breakdown,
-      };
-      try {
-        await this.#deliveryHandler(payload);
-      } catch (error) {
-        ctx.eventBus.emit('proactive:delegate-failed', {
-          sessionId: session.id,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-        return;
-      }
-      if (this.#stopped) return;
-    } else {
-      // Event-bus fallback for non-bridge deployments.
-      ctx.eventBus.emit('proactive:delegate', {
-        sessionId: session.id,
-        directive,
-        score: decision.score,
-        breakdown: decision.breakdown,
-      });
-    }
-
-    const sends = this.#recentSends(session.id, now);
-    sends.push(now);
-    this.#sends.set(session.id, sends);
-    if (this.#config?.persistence.enabled) this.#save();
-  }
-
-  /** Build a bundle and ask the LLM for content; `undefined` if unbuildable. */
-  async #tryGenerate(
-    ctx: PluginContext,
-    session: Session,
-    emotion: EmotionState,
-    decision: DecisionResult,
-    now: number,
-  ): Promise<ThoughtEngineResult | undefined> {
-    const config = this.#config;
-    if (!config) return undefined;
-    const bundle = buildContextBundle(ctx.sessions, session.id, emotion, now, {
-      historyTailMessages: config.context.historyTailMessages,
-    });
-    if (!bundle) return undefined;
-    return generateThought(ctx.llm, {
-      sessionId: session.id,
-      bundle,
-      score: decision.score,
-      breakdown: decision.breakdown,
-      persona: config.persona,
-      now,
-    });
-  }
-
-  async #deliver(ctx: PluginContext, candidate: ThoughtCandidate): Promise<void> {
-    if (this.#stopped) return;
-    if (this.#deliveryHandler) {
-      // `self`/verbatim bridge delivery: await the outbound transport first so a
-      // rejection skips the send slot (and the local `ctx.send`) entirely.
-      const payload: ProactiveDeliveryPayload = {
-        kind: 'send',
-        sessionId: candidate.sessionId,
-        content: candidate.content,
-        score: candidate.score,
-        breakdown: candidate.breakdown,
-      };
-      try {
-        await this.#deliveryHandler(payload);
-      } catch (error) {
-        ctx.eventBus.emit('proactive:delivery-failed', {
-          sessionId: candidate.sessionId,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-        return;
-      }
-      if (this.#stopped) return;
-    }
-    await ctx.send(candidate.sessionId, candidate.content);
-    const now = this.#nowFn();
-    const sends = this.#recentSends(candidate.sessionId, now);
-    sends.push(now);
-    this.#sends.set(candidate.sessionId, sends);
-    ctx.eventBus.emit('proactive:thought', {
-      sessionId: candidate.sessionId,
-      content: candidate.content,
-      score: candidate.score,
-      breakdown: candidate.breakdown,
-      stimuli: candidate.stimuli,
-      timestamp: now,
-    });
-    // Keep cooldown/cap state crash-safe: persist immediately after a send.
-    if (this.#config?.persistence.enabled) this.#save();
-  }
-
-  async #assessEmotion(
-    ctx: PluginContext,
-    session: Session,
-    emotion: EmotionState,
-    now: number,
-  ): Promise<EmotionState | undefined> {
-    const bundle = buildContextBundle(ctx.sessions, session.id, emotion, now, {
-      historyTailMessages: this.#config?.context.historyTailMessages,
-    });
-    if (!bundle) return undefined;
-    return this.#requestEmotionAssessment(ctx.llm, bundle);
-  }
-
-  async #requestEmotionAssessment(
-    llm: LLMProvider,
-    bundle: ContextBundle,
-  ): Promise<EmotionState | undefined> {
-    try {
-      const result = await llm.complete({
-        system: EMOTION_ASSESSMENT_INSTRUCTION,
-        messages: [{ role: 'user', content: serializeContext(bundle) }],
-        temperature: 0,
-      });
-      return parseEmotionAssessment(result.content);
-    } catch {
-      return undefined;
     }
   }
 
@@ -705,10 +449,6 @@ export class ProactiveChatPlugin implements Plugin {
     const recent = existing.filter((at) => now - at < ONE_DAY_MS);
     this.#sends.set(sessionId, recent);
     return recent;
-  }
-
-  #emitSkipped(ctx: PluginContext, sessionId: string, reason: string): void {
-    ctx.eventBus.emit('proactive:skipped', { sessionId, reason });
   }
 }
 

@@ -2,8 +2,9 @@
  * Shared types for the proactive-chat plugin.
  *
  * This module is intentionally dependency-free: every other module in the
- * plugin (and `src/config/config.ts`) imports its shapes from here so that the
- * pure decision/emotion/queue modules never pull in runtime singletons.
+ * plugin imports its shapes from here so that the pure decision/emotion/queue
+ * modules never pull in runtime singletons. The kernel does not import these
+ * shapes: the plugin owns its config slice end-to-end (see `config.ts`).
  */
 
 /** Per-session emotional state driving the deterministic interest score. */
