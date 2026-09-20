@@ -753,6 +753,117 @@ def test_register_injection_false_is_reported_without_raising():
     assert status == 200 and body["injected"] is False
 
 
+def test_register_injection_resolves_session_key_from_captured_store():
+    bridge.clear_session_routes()
+    ctx, result, _procs, _opener = _register_with_fakes()
+    token = result["settings"].token
+    session_id = "20260920_144726_9cdf793e"
+    real_key = "agent:main:telegram:dm:12345"
+    entry = SimpleNamespace(session_id=session_id, session_key=real_key)
+    store = SimpleNamespace(
+        lookup_by_session_id=lambda sid: entry if sid == session_id else None,
+        lookup_by_session_key=lambda _key: None,
+    )
+    event = SimpleNamespace(source=object(), metadata={})
+    try:
+        # First inbound message: pre_gateway_dispatch runs before the row exists, so it
+        # records no mapping but captures the store.
+        ctx.hooks["pre_gateway_dispatch"](event=event, gateway=SimpleNamespace(), session_store=store)
+        assert bridge.resolve_session_route(session_id) is None
+        status, body = post(result["server"].port,
+                            {"kind": "inject", "sessionId": session_id, "directive": "reach out"}, token=token)
+    finally:
+        bridge.clear_session_routes()
+        result["teardown"]()
+    assert status == 200 and body["injected"] is True
+    assert ctx.injected == [{"content": "reach out", "role": "user", "session_key": real_key}]
+
+
+def test_register_injection_mapped_id_uses_map_before_store():
+    bridge.clear_session_routes()
+    ctx, result, _procs, _opener = _register_with_fakes()
+    token = result["settings"].token
+    session_id = "sess-mapped"
+    real_key = "agent:main:telegram:dm:777"
+    entry = SimpleNamespace(session_id=session_id, session_key=real_key)
+    store_calls = {"lookup": 0}
+
+    def lookup_by_session_id(_sid):
+        store_calls["lookup"] += 1
+        return None
+
+    store = SimpleNamespace(
+        lookup_by_session_id=lookup_by_session_id,
+        lookup_by_session_key=lambda _key: entry,
+    )
+    gateway = SimpleNamespace(_session_key_for_source=lambda _source: real_key)
+    event = SimpleNamespace(source=object(), metadata={})
+    try:
+        ctx.hooks["pre_gateway_dispatch"](event=event, gateway=gateway, session_store=store)
+        assert bridge.resolve_session_route(session_id) == real_key
+        status, body = post(result["server"].port,
+                            {"kind": "inject", "sessionId": session_id, "directive": "hi"}, token=token)
+    finally:
+        bridge.clear_session_routes()
+        result["teardown"]()
+    assert status == 200 and body["injected"] is True
+    assert ctx.injected == [{"content": "hi", "role": "user", "session_key": real_key}]
+    assert store_calls["lookup"] == 0  # map hit: the store is never consulted
+
+
+def test_register_injection_store_failure_logs_no_key_reason():
+    logs = []
+    ctx = MockCtx(_register_config())
+    ctx.inject_result = False
+    ctx, result, _procs, _opener = _register_with_fakes(ctx=ctx, log=logs.append)
+    token = result["settings"].token
+    session_id = "sess-store-down"
+
+    class BoomStore:
+        def lookup_by_session_id(self, _sid):
+            raise RuntimeError("store caught mid-write")
+
+    event = SimpleNamespace(source=object(), metadata={})
+    try:
+        ctx.hooks["pre_gateway_dispatch"](event=event, gateway=SimpleNamespace(), session_store=BoomStore())
+        status, body = post(result["server"].port,
+                            {"kind": "inject", "sessionId": session_id, "directive": "x"}, token=token)
+    finally:
+        bridge.clear_session_routes()
+        result["teardown"]()
+    assert status == 200 and body["injected"] is False
+    # CLI-path fallback: no session_key passed, one-time hint logged.
+    assert ctx.injected == [{"content": "x", "role": "user", "session_key": None}]
+    assert any(f"no session_key resolved for {session_id}" in line for line in logs)
+    # The real reason is the missing key, NOT the allow-gateway flag.
+    assert not any("allow_gateway_injection" in line for line in logs)
+
+
+def test_register_injection_resolved_key_but_false_logs_allow_flag_reason():
+    logs = []
+    ctx = MockCtx(_register_config())
+    ctx.inject_result = False
+    ctx, result, _procs, _opener = _register_with_fakes(ctx=ctx, log=logs.append)
+    token = result["settings"].token
+    session_id = "sess-flag-off"
+    real_key = "agent:main:discord:dm:42"
+    entry = SimpleNamespace(session_id=session_id, session_key=real_key)
+    store = SimpleNamespace(lookup_by_session_id=lambda sid: entry if sid == session_id else None)
+    event = SimpleNamespace(source=object(), metadata={})
+    try:
+        ctx.hooks["pre_gateway_dispatch"](event=event, gateway=SimpleNamespace(), session_store=store)
+        status, body = post(result["server"].port,
+                            {"kind": "inject", "sessionId": session_id, "directive": "x"}, token=token)
+    finally:
+        bridge.clear_session_routes()
+        result["teardown"]()
+    assert status == 200 and body["injected"] is False
+    assert ctx.injected == [{"content": "x", "role": "user", "session_key": real_key}]
+    assert any(f"session_key {real_key!r} resolved for {session_id}" in line for line in logs)
+    assert any("allow_gateway_injection" in line for line in logs)
+    assert not any(f"no session_key resolved for {session_id}" in line for line in logs)
+
+
 def test_on_unload_stops_sidecar_and_callback():
     ctx, result, procs, _opener = _register_with_fakes()
     assert procs[0].terminated is False

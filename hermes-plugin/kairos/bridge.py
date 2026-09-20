@@ -57,10 +57,16 @@ the hook derives it from ``gateway._session_key_for_source(event.source)`` (fall
 ``session_store.lookup_by_session_key(session_key).session_id`` (fallbacks:
 ``peek_session_id``, ``gateway._peek_session_state(session_key).turn.agent.session_id``,
 and event metadata ``gateway_session_id``). The pairing is recorded in a bounded,
-thread-safe ``{session_id: session_key}`` map. The hook runs BEFORE the session row
-exists, so a brand-new conversation has no mapping until its next inbound message;
-callbacks for such an id fall back to CLI-style injection (``session_key`` omitted)
-and log a one-time hint.
+thread-safe ``{session_id: session_key}`` map.
+
+The hook also CAPTURES the live ``session_store`` object. The hook runs BEFORE the
+session row exists, so a brand-new conversation records no mapping on its first
+inbound message; at inject time an unmapped ``session_id`` is resolved directly through
+the captured store via ``SessionStore.lookup_by_session_id`` (``gateway/session.py:1242``,
+which returns a ``SessionEntry`` carrying ``session_key``) before falling back to
+CLI-style injection (``session_key`` omitted). Store access is defensive and bounded
+(never blocks the callback for more than ``SESSION_STORE_LOOKUP_TIMEOUT_SEC``); when
+injection fails the plugin logs the concrete reason chain instead of guessing.
 """
 
 from __future__ import annotations
@@ -106,6 +112,10 @@ __all__ = [
     "record_session_route",
     "resolve_session_route",
     "clear_session_routes",
+    "record_session_store",
+    "get_session_store",
+    "clear_session_store",
+    "resolve_session_key_from_store",
     "register",
     "DEFAULT_PORT",
     "DEFAULT_CALLBACK_PORT",
@@ -159,6 +169,11 @@ FORWARD_LATCH_SEC = 60.0
 
 # --- session-id -> session_key routing map (F1) -----------------------------
 MAX_SESSION_ROUTES = 200
+# Inject-time id -> key resolution through the captured gateway SessionStore.
+# Never let a store caught mid-write stall the callback: bound the lookup, and cap the
+# fallback scan of the routing index.
+SESSION_STORE_LOOKUP_TIMEOUT_SEC = 1.0
+SESSION_STORE_SCAN_CAP = 100
 
 LogFn = Callable[[str], None]
 MappingLike = Dict[str, Any]
@@ -367,6 +382,102 @@ _SESSION_ROUTES_LOCK = threading.Lock()
 _HINTED_UNMAPPED: "OrderedDict[str, None]" = OrderedDict()
 _HINTED_LOCK = threading.Lock()
 
+# Latest gateway ``SessionStore`` observed in ``pre_gateway_dispatch``. Used to resolve
+# an unmapped session_id -> session_key at inject time (see resolve_session_key_from_store).
+_SESSION_STORE: Optional[Any] = None
+_SESSION_STORE_LOCK = threading.Lock()
+
+
+def record_session_store(store: Any) -> None:
+    """Keep the latest ``pre_gateway_dispatch`` ``session_store`` (no-op when ``None``)."""
+    if store is None:
+        return
+    global _SESSION_STORE
+    with _SESSION_STORE_LOCK:
+        _SESSION_STORE = store
+
+
+def get_session_store() -> Optional[Any]:
+    """The most recently captured gateway ``SessionStore`` (or ``None``)."""
+    with _SESSION_STORE_LOCK:
+        return _SESSION_STORE
+
+
+def clear_session_store() -> None:
+    """Drop the captured store (tests / plugin reload)."""
+    global _SESSION_STORE
+    with _SESSION_STORE_LOCK:
+        _SESSION_STORE = None
+
+
+def _entry_session_key(entry: Any) -> str:
+    """Read ``session_key`` off a ``SessionEntry`` (attr) or dict-shaped entry, defensively."""
+    if entry is None:
+        return ""
+    key = getattr(entry, "session_key", None)
+    if key is None and isinstance(entry, dict):
+        key = entry.get("session_key")
+    return key.strip() if isinstance(key, str) else ""
+
+
+def _lookup_session_key_in_store(store: Any, session_id: str) -> Optional[str]:
+    """Resolve ``session_id`` -> ``session_key`` via the store's by-id API, else a bounded scan.
+
+    Prefers the direct ``SessionStore.lookup_by_session_id`` (``gateway/session.py:1242``);
+    falls back to iterating at most :data:`SESSION_STORE_SCAN_CAP` recent entries.
+    """
+    lookup = getattr(store, "lookup_by_session_id", None)
+    if callable(lookup):
+        key = _entry_session_key(lookup(session_id))
+        if key:
+            return key
+    lister = getattr(store, "list_sessions", None)
+    if callable(lister):
+        for entry in list(lister() or [])[:SESSION_STORE_SCAN_CAP]:
+            if getattr(entry, "session_id", None) == session_id:
+                key = _entry_session_key(entry)
+                if key:
+                    return key
+    return None
+
+
+def resolve_session_key_from_store(
+    session_id: str,
+    *,
+    store: Any = None,
+    timeout: float = SESSION_STORE_LOOKUP_TIMEOUT_SEC,
+) -> Optional[str]:
+    """Best-effort ``session_id`` -> ``session_key`` through the captured store.
+
+    Returns ``None`` on any failure (missing store, empty id, store mid-write). The lookup
+    runs in a daemon thread and is abandoned after *timeout* seconds so a blocked store can
+    never stall the callback.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    target = store if store is not None else get_session_store()
+    if target is None:
+        return None
+    result: "Dict[str, Optional[str]]" = {"key": None}
+
+    def _probe() -> None:
+        try:
+            result["key"] = _lookup_session_key_in_store(target, sid)
+        except Exception:
+            result["key"] = None
+
+    worker: Optional[threading.Thread] = None
+    try:
+        worker = threading.Thread(target=_probe, name="kairos-session-store-lookup", daemon=True)
+        worker.start()
+        worker.join(timeout=max(0.0, float(timeout)))
+    except Exception:
+        return None
+    if worker is None or worker.is_alive():
+        return None
+    return result["key"]
+
 
 def record_session_route(session_id: str, session_key: str) -> None:
     """Record ``{session_id: session_key}`` (bounded to ``MAX_SESSION_ROUTES``, LRU-pruned)."""
@@ -391,11 +502,12 @@ def resolve_session_route(session_id: str) -> Optional[str]:
 
 
 def clear_session_routes() -> None:
-    """Drop all recorded routes and hint latches (tests / plugin reload)."""
+    """Drop all recorded routes, the captured store, and hint latches (tests / plugin reload)."""
     with _SESSION_ROUTES_LOCK:
         _SESSION_ROUTES.clear()
     with _HINTED_LOCK:
         _HINTED_UNMAPPED.clear()
+    clear_session_store()
 
 
 def _hint_unmapped(logger: LogFn, session_id: str) -> None:
@@ -410,6 +522,32 @@ def _hint_unmapped(logger: LogFn, session_id: str) -> None:
         while len(_HINTED_UNMAPPED) > MAX_SESSION_ROUTES:
             _HINTED_UNMAPPED.popitem(last=False)
     logger(f"no session_key observed for {sid}; gateway delivery needs an inbound message first")
+
+
+def _log_injection_failure(
+    logger: LogFn,
+    session_id: Optional[str],
+    session_key: Optional[str],
+    plugin_id: str = "kairos",
+) -> None:
+    """Log the concrete reason an inject attempt failed (never the flag-first guess).
+
+    Distinguishes "no key could be resolved" (no inbound message observed yet / store mid-write
+    / lookup timed out) from "a key was resolved but the gateway rejected the injection"
+    (``allow_gateway_injection`` unset, or no live gateway).
+    """
+    sid = str(session_id or "").strip() or "-"
+    if session_key:
+        logger(
+            f"injection failed: session_key {session_key!r} resolved for {sid} but the gateway "
+            f"rejected the injection (check plugins.entries.{plugin_id}.allow_gateway_injection "
+            "is true and that a live gateway is available)"
+        )
+    else:
+        logger(
+            f"injection failed: no session_key resolved for {sid} "
+            "(no inbound message observed for this session yet)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -852,9 +990,8 @@ class CallbackServer:
             self.log(f"inject_message -> {injected} (session={session_id or '-'})")
             if not injected:
                 self.log(
-                    "HINT: injection returned False. In gateway mode set "
-                    f"plugins.entries.{self.plugin_id}.allow_gateway_injection: true "
-                    "in ~/.hermes/config.yaml (CLI sessions are always allowed)."
+                    "injection returned False; the inject adapter logs the resolved session_key "
+                    "and the concrete reason above"
                 )
             return 200, {"ok": True, "injected": injected}
 
@@ -1137,15 +1274,22 @@ def make_inject_fn(
     ctx: Any,
     log: Optional[LogFn] = None,
     resolve_route: Optional[Callable[[str], Optional[str]]] = None,
+    resolve_store: Optional[Callable[[str], Optional[str]]] = None,
 ) -> Callable[[str, Optional[str]], bool]:
     """Build the ``inject_message`` adapter used by the callback listener.
 
     ``session_id`` (from the sidecar payload) is translated to the gateway
-    ``session_key`` observed via ``pre_gateway_dispatch``. Unmapped ids take the
-    CLI-style path (``session_key`` omitted) and log a one-time hint (F1).
+    ``session_key`` observed via ``pre_gateway_dispatch``. An id not yet in that map is
+    re-resolved through the captured gateway ``session_store`` (see
+    :func:`resolve_session_key_from_store`) — fixing the brand-new-conversation case where
+    the mapping hook runs before the session row exists. Only when no key can be resolved
+    does it fall back to CLI-style injection (``session_key`` omitted) and log a one-time
+    hint. A failed inject logs the concrete reason chain.
     """
     logger = _resolve_log(log)
     resolve = resolve_route or resolve_session_route
+    resolve_via_store = resolve_store or resolve_session_key_from_store
+    plugin_id = _plugin_id(ctx)
 
     def _inject(content: str, session_id: Optional[str]) -> bool:
         session_key: Optional[str] = None
@@ -1155,12 +1299,20 @@ def make_inject_fn(
             except Exception:
                 session_key = None
             if not session_key:
+                try:
+                    session_key = resolve_via_store(session_id)
+                except Exception:
+                    session_key = None
+            if not session_key:
                 _hint_unmapped(logger, session_id)
         try:
-            return bool(ctx.inject_message(content, role="user", session_key=session_key or None))
+            injected = bool(ctx.inject_message(content, role="user", session_key=session_key or None))
         except Exception as exc:
             logger(f"inject_message raised (ignored): {exc}")
             return False
+        if not injected:
+            _log_injection_failure(logger, session_id, session_key, plugin_id)
+        return injected
 
     return _inject
 
@@ -1307,6 +1459,9 @@ def make_gateway_dispatch_hook(log: Optional[LogFn] = None) -> Callable[..., Any
     def _hook(**payload: Any) -> None:
         try:
             event = payload.get("event")
+            # Capture the store for inject-time id->key resolution (brand-new conversations
+            # have no row yet, so nothing usable is recorded on the first message).
+            record_session_store(payload.get("session_store"))
             source = getattr(event, "source", None)
             session_key = _dispatch_session_key(payload, source, event)
             session_id = _dispatch_session_id(payload, session_key, event)

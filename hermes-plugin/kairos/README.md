@@ -157,20 +157,28 @@ So that gateway delivery can work, the plugin also registers the
 `session_store._generate_session_key`) and the internal `session_id` (from
 `session_store.lookup_by_session_key(...)`, fallbacks `peek_session_id`, the live
 agent's `session_id`, and event metadata), and records `{session_id: session_key}`.
+It also **captures the live `session_store` object**, so at inject time an id that is
+not yet in the map is resolved directly through `SessionStore.lookup_by_session_id`
+(which returns a `SessionEntry` carrying `session_key`; bounded-scan fallback, ≤1 s).
 
 What this means in practice:
 
-- **CLI delivery works out of the box.** With no mapping, `inject_message` is called
+- **CLI delivery works out of the box.** With no key at all, `inject_message` is called
   without `session_key` and lands in the CLI queue.
-- **Gateway delivery requires the mapping to have observed the session** — i.e. an
-  inbound message on that platform first. `pre_gateway_dispatch` runs *before* the
-  session row is created, so a brand-new conversation's first message cannot be mapped
-  yet; the mapping is recorded on its next inbound message. Until then, callbacks for
-  that id fall back to CLI-style injection and log a one-time hint:
+- **Gateway delivery resolves the key lazily.** `pre_gateway_dispatch` runs *before* the
+  session row is created, so a brand-new conversation's first message records no
+  mapping; the callback for that id resolves the key on demand via the captured
+  `session_store` and injects with `inject_message(..., session_key=<real key>)`. Only
+  if no key can be resolved does it fall back to CLI-style injection and log a one-time
   `no session_key observed for <id>; gateway delivery needs an inbound message first`.
-- A mapped id calls `inject_message(..., session_key=<real key>)`. `True` means the
+- A resolved id calls `inject_message(..., session_key=<real key>)`. `True` means the
   gateway **accepted** the injection for async dispatch, not that delivery completed.
   A never-seen session logs `Plugin message injection was not routed` — expected.
+- When injection returns `False`, the plugin logs the concrete reason:
+  `injection failed: no session_key resolved for <id> (no inbound message observed for
+  this session yet)` versus
+  `injection failed: session_key '<key>' resolved for <id> but the gateway rejected the
+  injection (check plugins.entries.kairos.allow_gateway_injection ...)`.
 - A user-visible gateway delivery therefore requires: a configured platform session,
   `allow_gateway_injection: true`, and a working LLM key for the follow-up turn.
 
@@ -197,7 +205,7 @@ What this means in practice:
 | Health never passes after a crash | Stale sidecar on the port: its `nonce` no longer matches. The plugin kills the pid in `<dataDir>/sidecar.pid` and retries once; otherwise kill it manually (`taskkill /PID <pid> /T /F`). |
 | `could not start callback listener on port 8672` | Port in use. Change `callbackPort` (the sidecar `--callback-url` is derived from it). |
 | Sidecar port conflict on `8671` (EADDRINUSE) | An orphaned sidecar is holding the port. Check `<dataDir>/sidecar.pid`; the plugin's orphan-kill path handles a live pid, otherwise kill it manually and restart the plugin. |
-| `inject_message -> False` + unmapped hint | Gateway (non-CLI) injection needs `plugins.entries.kairos.allow_gateway_injection: true` **and** a mapped session (an inbound message on that platform first). CLI sessions always work. |
+| `inject_message -> False` | Read the logged reason: `no session_key resolved for <id>` means no inbound message has been observed for that session yet (or the store lookup timed out); `session_key '<key>' ... rejected` means gateway injection is disabled — set `plugins.entries.kairos.allow_gateway_injection: true`. CLI sessions always work. |
 | `415 unsupported media type` in logs | A caller POSTed to `/speak` with a non-`application/json` content-type. Send `Content-Type: application/json`. |
 | `413 payload too large` in logs | A `/speak` (or `/events`) body exceeded 1 MiB. Keep payloads small. |
 | `401 unauthorized` in logs | Token mismatch. Both sides must use the same token; if you left `token` unset, read the generated token from the startup log, or set an explicit token. |
