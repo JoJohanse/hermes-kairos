@@ -1,49 +1,46 @@
 # hermes-kairos
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square) ![Node >= 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen?style=flat-square) ![Runtime dependencies: 0](https://img.shields.io/badge/runtime%20dependencies-0-orange?style=flat-square)
+
 [English](README.md) | **中文**
 
-**KAIROS**（Autonomous Initiative and Response Orchestration System 内核）是一个小型、零依赖的 agent 运行时，用于构建能**主动发起**对话而不仅是被动应答的智能体。它提供自治 agent 所需的共享服务（类型化事件总线、内存态会话/消息存储、带重叠保护的间隔调度器、可插拔 LLM Provider、故障隔离的插件注册表），而把所有行为委托给插件。首个内置插件是**主动性对话**插件——决定 agent 何时应该主动开口。内核刻意保持精简：零运行时依赖、通过全局 `fetch` 访问 LLM，对持久化、传输、UI 不做任何假设——这些都可以由部署环境（或后续插件）按需叠加。
+**KAIROS**（Autonomous Initiative and Response Orchestration System 内核）是一个小型、零依赖的 agent 运行时，用于构建能**主动发起**对话而不仅是被动应答的智能体。内核提供自治 agent 所需的共享服务——类型化事件总线、内存态会话/消息存储、带重叠保护的间隔调度器、可插拔 LLM Provider、故障隔离的插件注册表——并把所有行为委托给插件；首个内置插件是**主动性对话**插件，决定 agent 何时应该主动开口。
+
+## 目录
+
+- [架构](#架构)
+  - [生命周期](#生命周期)
+- [环境要求](#环境要求)
+- [安装](#安装)
+- [运行](#运行)
+- [测试](#测试)
+- [在 hermes-agent 中安装本插件](#在-hermes-agent-中安装本插件)
+  - [投递模式](#投递模式)
+  - [前置要求](#前置要求)
+  - [安装步骤](#安装步骤)
+  - [验证](#验证)
+  - [注意事项](#注意事项)
+- [配置](#配置)
+
+---
 
 ## 架构
 
 ```
 hermes-kairos/
 ├── src/
-│   ├── index.ts                     # 启动引导：loadConfig → runtime → plugins → start → SIGINT 优雅退出
-│   ├── config/
-│   │   └── config.ts                # loadConfig()：环境变量默认值 + 可选 hermes.config.json
-│   ├── core/
-│   │   ├── types.ts                 # Message, Session, MessageRole
-│   │   ├── event-bus.ts             # 类型化发布/订阅（on/once/off/emit/clear）
-│   │   ├── session-manager.ts       # 内存态会话 + 消息历史 + 空闲跟踪
-│   │   ├── storage.ts               # JsonStore：原子写、可注入 fs 的 JSON 文件存储
-│   │   └── runtime.ts               # HermesRuntime：装配 bus、sessions、scheduler、llm、plugins
-│   ├── hermes-bridge/               # 供 hermes-agent 插件使用的 HTTP sidecar 入口
-│   ├── llm/
-│   │   ├── types.ts                 # LLMProvider / CompletionRequest / CompletionResult
-│   │   ├── openai-compatible.ts     # 基于 fetch 的 OpenAI /chat/completions provider
-│   │   └── mock.ts                  # 测试用确定性 provider
-│   ├── plugins/
-│   │   ├── types.ts                 # Plugin、PluginContext（含 send）
-│   │   └── registry.ts              # PluginRegistry：故障隔离的 init/teardown
-│   ├── scheduler/
-│   │   └── scheduler.ts             # setInterval 任务，跳过重叠执行
+│   ├── config/               # loadConfig()：环境变量默认值 + 可选 hermes.config.json
+│   ├── core/                 # 类型定义、类型化事件总线、会话管理器、JsonStore、runtime 装配
+│   ├── hermes-bridge/        # 供 hermes-agent 插件使用的 HTTP sidecar 入口
+│   ├── llm/                  # 基于 fetch 的 OpenAI 兼容 provider + 测试用确定性 mock
+│   ├── plugins/              # Plugin / PluginContext 类型、故障隔离注册表
+│   ├── scheduler/            # setInterval 任务，跳过重叠执行
 │   └── builtins/
-│       └── proactive-chat/
-│           ├── index.ts             # ProactiveChatPlugin：心跳、计数器、事件
-│           ├── decision.ts          # 守卫规则 + 评分 + 分档（纯函数）
-│           ├── emotion.ts           # 时间驱动情绪 + 内存存储（纯数学）
-│           ├── delayed-queue.ts     # 每会话 HOLD stub 队列（纯函数）
-│           ├── context.ts           # 基于 SessionManager 的 ContextBundle 构建器
-│           ├── thought-engine.ts    # prompt 构建 + SKIP 解析
-│           ├── prompts.ts           # 默认 persona/指令字符串
-│           ├── types.ts             # 共享类型（零依赖）
-│           └── README.md            # 插件行为 + 落盘/序列化上下文文档
-├── hermes-plugin/kairos/            # hermes-agent 原生插件（桥接 sidecar）
-├── package.json
-├── tsconfig.json
-└── .gitignore
+│       └── proactive-chat/   # 主动性对话插件（详见其 README）
+└── hermes-plugin/kairos/     # hermes-agent 原生插件（桥接 sidecar）
 ```
+
+> 内核刻意保持精简：零运行时依赖、通过全局 `fetch` 访问 LLM，对持久化、传输、UI 不做任何假设——这些都可以由部署环境（或后续插件）按需叠加。proactive-chat 插件的内部实现见 [`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md)。
 
 ### 生命周期
 
@@ -81,11 +78,23 @@ npm run build    # tsc → dist/   （运行：node dist/index.js）
 npm test         # vitest run（测试与源码同目录，*.test.ts）
 ```
 
-## 在 hermes-agent 中安装本插件（安装引导）
+---
+
+## 在 hermes-agent 中安装本插件
 
 本仓库自带一个 [hermes-agent](https://github.com/NousResearch/hermes-agent) 原生插件（`hermes-plugin/kairos/`），把 proactive-chat 的主动性对话能力以 hermes 插件形式接入：插件自动拉起并监管 kairos sidecar（`src/hermes-bridge/`），把 hermes 的会话活动喂给 KAIROS 门控，在合适时机通过 `ctx.inject_message()` 主动发起对话。
 
 > English guide: [README.md](README.md#install-as-a-hermes-agent-plugin)。
+
+### 投递模式
+
+`deliveryMode` 配置决定主动消息由谁执笔：
+
+|  | `turn`（默认） | `verbatim` |
+| --- | --- | --- |
+| 消息由谁撰写 | hermes —— agent 重新进入对话并亲自撰写回复 | kairos —— sidecar 已生成最终文本 |
+| 投递路径 | `ctx.inject_message()` | `hermes send --to <hermesSendTarget>` |
+| 适用场景 | 希望 agent 先思考再开口 | 即发即忘的外发；需配置 `hermesSendTarget` |
 
 ### 前置要求
 
@@ -116,7 +125,8 @@ npm test         # vitest run（测试与源码同目录，*.test.ts）
    KAIROS_DIST="<本仓库绝对路径>/dist/hermes-bridge/main.js"
    ```
 
-   > 插件拷贝到 `~/.hermes/plugins/` 后，默认的相对路径 `~/.hermes/dist/...` 并不存在，**这一步必须做**；也可以改为在 `plugins.entries.kairos.settings` 里配置 `sidecarCommand` 数组。
+   > [!IMPORTANT]
+   > 插件拷贝到 `~/.hermes/plugins/` 后，默认的相对路径 `~/.hermes/dist/...` 并不存在——**必须设置 `KAIROS_DIST`**；也可以改为在 `plugins.entries.kairos.settings` 里配置 `sidecarCommand` 数组。
 
 4. 在 `~/.hermes/config.yaml` 中启用并放行注入（gateway 模式必需）：
 
@@ -134,37 +144,42 @@ npm test         # vitest run（测试与源码同目录，*.test.ts）
            # token 留空 = 每次启动自动生成随机 token（推荐）
    ```
 
-5. 验证安装：
+### 验证
+
+1. 确认注册：
 
    ```bash
    hermes plugins list            # kairos 应显示 enabled
    hermes plugins doctor kairos   # 应显示 registration passed、3 hook(s)
    ```
 
-6. 启动 `hermes gateway`（或进入 CLI 会话），日志出现以下内容即安装成功：
+2. 启动 `hermes gateway`（或进入 CLI 会话），日志出现以下内容即安装成功：
 
    ```text
    [kairos] sidecar is healthy
    [kairos] kairos plugin ready
    ```
 
-### 触发与验证
+3. 触发检查——任意平台收到用户消息后，kairos hook 会把活动转发给 sidecar，心跳门控（默认 60s 一次）自动评估是否主动开口；`turn` 模式下通过 `ctx.inject_message()` 让 hermes 主动发起新话题。与 hermes 对话一轮后，可强制一次评估：
 
-- 任意平台收到用户消息后，kairos hook 会把活动转发给 sidecar，心跳门控（默认 60s 一次）自动评估是否主动开口；`turn` 模式下通过 `ctx.inject_message()` 让 hermes 主动发起新话题
-- 快速自测：与 hermes 对话一轮后，强制一次评估——
+   ```bash
+   curl -X POST http://127.0.0.1:8671/trigger -H "authorization: Bearer <token>"
+   ```
 
-  ```bash
-  curl -X POST http://127.0.0.1:8671/trigger -H "authorization: Bearer <token>"
-  ```
-
-- 日志确认：`[kairos] inject_message -> True` 表示主动消息已被 hermes 接受
+   日志确认：`[kairos] inject_message -> True` 表示主动消息已被 hermes 接受。
 
 ### 注意事项
 
-- `turn` 模式的主动消息只会路由到**已存在**的会话（该平台/渠道此前有过入站消息）；对从未聊过的全新会话会记录 `no session_key observed` 提示
-- sidecar 默认只绑定 `127.0.0.1`；token 默认自动生成，显式设 `token: "none"` 才会关闭鉴权（不推荐）
-- 插件自身状态（情绪 / HOLD 队列 / 冷却计数）持久化在 `storage.dataDir`（默认 `.hermes-data/`），重启自动恢复
+> [!WARNING]
+> `turn` 模式的主动消息只会路由到**已存在**的会话（该平台/渠道此前有过入站消息）；对从未聊过的全新会话会记录 `no session_key observed` 提示。
+
+> [!CAUTION]
+> sidecar 默认只绑定 `127.0.0.1`；token 默认自动生成，显式设 `token: "none"` 才会关闭鉴权（**不推荐**）。
+
+- 插件自身状态（情绪 / HOLD 队列 / 冷却计数）持久化在 `storage.dataDir`（默认 `.hermes-data/`），重启自动恢复。
 - 完整参考（路由细节、verbatim 模式、故障排查表）：[`hermes-plugin/kairos/README.md`](hermes-plugin/kairos/README.md)
+
+---
 
 ## 配置
 

@@ -1,49 +1,46 @@
 # hermes-kairos
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square) ![Node >= 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen?style=flat-square) ![Runtime dependencies: 0](https://img.shields.io/badge/runtime%20dependencies-0-orange?style=flat-square)
+
 **English** | [中文](README_zh.md)
 
-**KAIROS** — the Kernel for Autonomous Initiative and Response Orchestration System — is a small, dependency-free agent runtime for building agents that can *start* conversations rather than only answer them; it provides the shared services an autonomous agent needs (a typed event bus, in-memory session/message storage, an interval scheduler with overlap protection, a pluggable LLM provider, and a failure-isolated plugin registry) while delegating all behavior to plugins, the first of which is a **proactive-conversation** plugin that decides when the agent should speak up on its own. The kernel is intentionally lean: zero runtime dependencies, LLM access through the global `fetch`, and no opinion about persistence, transport, or UI — those are additions a deployment (or a later plugin) can layer on.
+**KAIROS** (Kernel for Autonomous Initiative and Response Orchestration System) is a small, dependency-free agent runtime for building agents that *start* conversations rather than only answer them. The kernel supplies the shared services an autonomous agent needs — a typed event bus, in-memory session/message storage, an interval scheduler with overlap protection, a pluggable LLM provider, and a failure-isolated plugin registry — and delegates all behavior to plugins; the first of them is a **proactive-conversation** plugin that decides when the agent should speak up on its own.
+
+## Contents
+
+- [Architecture](#architecture)
+  - [Lifecycle](#lifecycle)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Run](#run)
+- [Test](#test)
+- [Install as a hermes-agent plugin](#install-as-a-hermes-agent-plugin)
+  - [Delivery modes](#delivery-modes)
+  - [Prerequisites](#prerequisites)
+  - [Steps](#steps)
+  - [Verify](#verify)
+  - [Notes](#notes)
+- [Configuration](#configuration)
+
+---
 
 ## Architecture
 
 ```
 hermes-kairos/
 ├── src/
-│   ├── index.ts                     # bootstrap: loadConfig → runtime → plugins → start → SIGINT shutdown
-│   ├── config/
-│   │   └── config.ts                # loadConfig(): env defaults + optional hermes.config.json
-│   ├── core/
-│   │   ├── types.ts                 # Message, Session, MessageRole
-│   │   ├── event-bus.ts             # typed pub/sub (on/once/off/emit/clear)
-│   │   ├── session-manager.ts       # in-memory sessions + message history + idle tracking
-│   │   ├── storage.ts               # JsonStore: atomic, injectable-fs JSON file store
-│   │   └── runtime.ts               # HermesRuntime: wires bus, sessions, scheduler, llm, plugins
-│   ├── hermes-bridge/               # HTTP sidecar entry used by the hermes-agent plugin
-│   ├── llm/
-│   │   ├── types.ts                 # LLMProvider / CompletionRequest / CompletionResult
-│   │   ├── openai-compatible.ts     # fetch-based OpenAI /chat/completions provider
-│   │   └── mock.ts                  # deterministic provider for tests
-│   ├── plugins/
-│   │   ├── types.ts                 # Plugin, PluginContext (incl. send)
-│   │   └── registry.ts              # PluginRegistry: failure-isolated init/teardown
-│   ├── scheduler/
-│   │   └── scheduler.ts             # setInterval tasks, skips overlapping runs
+│   ├── config/               # loadConfig(): env defaults + optional hermes.config.json
+│   ├── core/                 # types, typed event bus, session manager, JsonStore, runtime
+│   ├── hermes-bridge/        # HTTP sidecar entry used by the hermes-agent plugin
+│   ├── llm/                  # fetch-based OpenAI-compatible provider + deterministic mock
+│   ├── plugins/              # Plugin / PluginContext types, failure-isolated registry
+│   ├── scheduler/            # setInterval tasks, skips overlapping runs
 │   └── builtins/
-│       └── proactive-chat/
-│           ├── index.ts             # ProactiveChatPlugin: heartbeat, counters, events
-│           ├── decision.ts          # guardrails + score + banding (pure)
-│           ├── emotion.ts           # time-driven emotion + in-memory store (pure maths)
-│           ├── delayed-queue.ts     # per-session HOLD stub queue (pure)
-│           ├── context.ts           # ContextBundle builder from SessionManager
-│           ├── thought-engine.ts    # prompt construction + SKIP parsing
-│           ├── prompts.ts           # default persona/instruction strings
-│           ├── types.ts             # shared shapes (dependency-free)
-│           └── README.md            # plugin behavior + on-disk/serialized context docs
-├── hermes-plugin/kairos/            # native hermes-agent plugin (bridges to the sidecar)
-├── package.json
-├── tsconfig.json
-└── .gitignore
+│       └── proactive-chat/   # the proactive-conversation plugin (internals: its own README)
+└── hermes-plugin/kairos/     # native hermes-agent plugin (bridges to the sidecar)
 ```
+
+> The kernel is intentionally lean: zero runtime dependencies, LLM access through the global `fetch`, and no opinion about persistence, transport, or UI — those are additions a deployment (or a later plugin) can layer on. The proactive-chat plugin's internals are documented in [`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md).
 
 ### Lifecycle
 
@@ -81,11 +78,23 @@ Press `Ctrl+C` to stop; the SIGINT/SIGTERM handler stops the runtime gracefully.
 npm test         # vitest run (colocated *.test.ts)
 ```
 
+---
+
 ## Install as a hermes-agent plugin
 
 This repo ships a native [hermes-agent](https://github.com/NousResearch/hermes-agent) plugin (`hermes-plugin/kairos/`) that exposes the proactive-conversation capability through the official hermes plugin contract: the plugin spawns and supervises the kairos sidecar (`src/hermes-bridge/`), feeds hermes session activity into the KAIROS gate, and at the right moment calls `ctx.inject_message()` so hermes starts a conversation on its own.
 
 > 中文安装指南见 [README_zh.md](README_zh.md)。
+
+### Delivery modes
+
+The `deliveryMode` setting decides who writes the proactive message:
+
+|  | `turn` *(default)* | `verbatim` |
+| --- | --- | --- |
+| Who authors the message | hermes — the agent re-enters the conversation and writes its own reply | kairos — the sidecar has already produced the final text |
+| Delivery path | `ctx.inject_message()` | `hermes send --to <hermesSendTarget>` |
+| Best for | When the agent should *think* before speaking | Fire-and-forget outbound; requires `hermesSendTarget` |
 
 ### Prerequisites
 
@@ -116,7 +125,8 @@ This repo ships a native [hermes-agent](https://github.com/NousResearch/hermes-a
    KAIROS_DIST="<absolute path to this repo>/dist/hermes-bridge/main.js"
    ```
 
-   > Once the plugin is copied to `~/.hermes/plugins/`, the default relative path `~/.hermes/dist/...` does not exist — **this step is mandatory**. Alternatively configure a `sidecarCommand` array under `plugins.entries.kairos.settings`.
+   > [!IMPORTANT]
+   > Once the plugin is copied to `~/.hermes/plugins/`, the default relative path `~/.hermes/dist/...` does not exist — **setting `KAIROS_DIST` is mandatory**. Alternatively configure a `sidecarCommand` array under `plugins.entries.kairos.settings`.
 
 4. Enable the plugin and allow injection in `~/.hermes/config.yaml` (required for gateway mode):
 
@@ -134,37 +144,42 @@ This repo ships a native [hermes-agent](https://github.com/NousResearch/hermes-a
            # leave token empty = a random token is generated at every start (recommended)
    ```
 
-5. Verify:
+### Verify
+
+1. Check registration:
 
    ```bash
    hermes plugins list            # kairos should show enabled
    hermes plugins doctor kairos   # should show registration passed, 3 hook(s)
    ```
 
-6. Start `hermes gateway` (or a CLI session). Successful install looks like:
+2. Start `hermes gateway` (or a CLI session). Successful install looks like:
 
    ```text
    [kairos] sidecar is healthy
    [kairos] kairos plugin ready
    ```
 
-### Trigger and verify
+3. Trigger check — on any inbound user message, the kairos hooks forward the activity to the sidecar and the heartbeat gate (every 60s by default) evaluates whether to reach out; in `turn` mode the plugin calls `ctx.inject_message()` so hermes starts a new topic itself. After one exchange with hermes you can force an evaluation:
 
-- On any inbound user message, the kairos hooks forward the activity to the sidecar and the heartbeat gate (every 60s by default) evaluates whether to reach out; in `turn` mode the plugin calls `ctx.inject_message()` so hermes starts a new topic itself.
-- Quick self-test: after one exchange with hermes, force an evaluation —
+   ```bash
+   curl -X POST http://127.0.0.1:8671/trigger -H "authorization: Bearer <token>"
+   ```
 
-  ```bash
-  curl -X POST http://127.0.0.1:8671/trigger -H "authorization: Bearer <token>"
-  ```
-
-- Log proof: `[kairos] inject_message -> True` means the proactive message was accepted by hermes.
+   Log proof: `[kairos] inject_message -> True` means the proactive message was accepted by hermes.
 
 ### Notes
 
-- In `turn` mode proactive messages only route to **existing** sessions (the platform/channel must have seen an inbound message before); brand-new sessions log a `no session_key observed` hint.
-- The sidecar binds to `127.0.0.1` only; a token is generated automatically by default — set `token: "none"` explicitly to disable auth (not recommended).
+> [!WARNING]
+> In `turn` mode proactive messages only route to **existing** sessions (the platform/channel must have seen an inbound message before); brand-new sessions log a `no session_key observed` hint.
+
+> [!CAUTION]
+> The sidecar binds to `127.0.0.1` only; a token is generated automatically by default — set `token: "none"` explicitly to disable auth (**not recommended**).
+
 - The plugin's own state (emotion / HOLD queue / cooldown counters) persists under `storage.dataDir` (default `.hermes-data/`) and survives restarts.
 - Full reference (routing details, verbatim mode, troubleshooting table): [`hermes-plugin/kairos/README.md`](hermes-plugin/kairos/README.md)
+
+---
 
 ## Configuration
 
