@@ -77,6 +77,89 @@ Press `Ctrl+C` to stop; the SIGINT/SIGTERM handler stops the runtime gracefully.
 npm test         # vitest run (colocated *.test.ts)
 ```
 
+## 在 hermes-agent 中安装本插件（安装引导）
+
+本仓库自带一个 [hermes-agent](https://github.com/NousResearch/hermes-agent) 原生插件（`hermes-plugin/kairos/`），把 proactive-chat 的主动性对话能力以 hermes 插件形式接入：插件自动拉起并监管 kairos sidecar（`src/hermes-bridge/`），把 hermes 的会话活动喂给 KAIROS 门控，在合适时机通过 `ctx.inject_message()` 主动发起对话。
+
+### 前置要求
+
+- hermes-agent（Python >= 3.11）已安装且 `hermes` 命令可用
+- Node.js >= 20 + npm（sidecar 运行时）
+- hermes 已配置可用的 LLM（`~/.hermes/config.yaml` 的 `model:` 段）
+
+### 安装步骤
+
+1. 构建本仓库（产出 `dist/hermes-bridge/main.js`）：
+
+   ```bash
+   npm install && npm run build
+   ```
+
+2. 拷贝插件目录到 hermes：
+
+   ```bash
+   # Linux / macOS
+   cp -r hermes-plugin/kairos ~/.hermes/plugins/kairos
+   # Windows (PowerShell)
+   Copy-Item -Recurse hermes-plugin/kairos "$env:USERPROFILE\.hermes\plugins\kairos"
+   ```
+
+3. 告诉插件 sidecar 的位置 —— 设置环境变量（启动 hermes 前生效，推荐写进系统环境变量或 hermes 的 `.env`）：
+
+   ```bash
+   KAIROS_DIST="<本仓库绝对路径>/dist/hermes-bridge/main.js"
+   ```
+
+   > 插件拷贝到 `~/.hermes/plugins/` 后，默认的相对路径 `~/.hermes/dist/...` 并不存在，**这一步必须做**；也可以改为在 `plugins.entries.kairos.settings` 里配置 `sidecarCommand` 数组。
+
+4. 在 `~/.hermes/config.yaml` 中启用并放行注入（gateway 模式必需）：
+
+   ```yaml
+   plugins:
+     enabled:
+       - kairos
+     entries:
+       kairos:
+         allow_gateway_injection: true   # gateway 模式主动注入必需
+         settings:
+           deliveryMode: turn            # turn=hermes 组织语言; verbatim=kairos 生成内容经 hermes send 直投
+           port: 8671
+           callbackPort: 8672
+           # token 留空 = 每次启动自动生成随机 token（推荐）
+   ```
+
+5. 验证安装：
+
+   ```bash
+   hermes plugins list            # kairos 应显示 enabled
+   hermes plugins doctor kairos   # 应显示 registration passed、3 hook(s)
+   ```
+
+6. 启动 `hermes gateway`（或进入 CLI 会话），日志出现以下内容即安装成功：
+
+   ```text
+   [kairos] sidecar is healthy
+   [kairos] kairos plugin ready
+   ```
+
+### 触发与验证
+
+- 任意平台收到用户消息后，kairos hook 会把活动转发给 sidecar，心跳门控（默认 60s 一次）自动评估是否主动开口；`turn` 模式下通过 `ctx.inject_message()` 让 hermes 主动发起新话题
+- 快速自测：与 hermes 对话一轮后，强制一次评估——
+
+  ```bash
+  curl -X POST http://127.0.0.1:8671/trigger -H "authorization: Bearer <token>"
+  ```
+
+- 日志确认：`[kairos] inject_message -> True` 表示主动消息已被 hermes 接受
+
+### 注意事项
+
+- `turn` 模式的主动消息只会路由到**已存在**的会话（该平台/渠道此前有过入站消息）；对从未聊过的全新会话会记录 `no session_key observed` 提示
+- sidecar 默认只绑定 `127.0.0.1`；token 默认自动生成，显式设 `token: "none"` 才会关闭鉴权（不推荐）
+- 插件自身状态（情绪 / HOLD 队列 / 冷却计数）持久化在 `storage.dataDir`（默认 `.hermes-data/`），重启自动恢复
+- 完整参考（路由细节、verbatim 模式、故障排查表）：[`hermes-plugin/kairos/README.md`](hermes-plugin/kairos/README.md)
+
 ## Configuration
 
 Environment variables:
