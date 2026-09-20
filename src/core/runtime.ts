@@ -1,0 +1,120 @@
+import type { EventMap } from '../core/event-bus.js';
+import { EventBus } from '../core/event-bus.js';
+import { SessionManager } from '../core/session-manager.js';
+import type { LLMProvider } from '../llm/types.js';
+import { PluginRegistry } from '../plugins/registry.js';
+import { Scheduler } from '../scheduler/scheduler.js';
+import type { Plugin } from '../plugins/types.js';
+
+/** Kernel-level events emitted by the runtime and its plugins. */
+export interface KernelEvents extends EventMap {
+  /** Emitted when a configuration object is supplied to the runtime. */
+  'runtime:config': { config: RuntimeConfig };
+  /** Emitted after `start()` finishes booting scheduler and plugins. */
+  'runtime:started': Record<string, never>;
+  /** Emitted after `stop()` finishes shutting everything down. */
+  'runtime:stopped': Record<string, never>;
+  /** Emitted by `PluginContext.send` for every outbound agent message. */
+  'message:outbound': { sessionId: string; content: string; timestamp: number };
+  /** Emitted when plugin initialization fails. */
+  'plugin:error': { plugin: string; error: unknown };
+}
+
+/** Minimal runtime configuration surface required by the kernel. */
+export interface RuntimeConfig {
+  llm: { baseURL: string; apiKey: string; model: string };
+  plugins: Record<string, unknown>;
+}
+
+/** Dependencies injected into {@link HermesRuntime}. */
+export interface HermesRuntimeOptions {
+  config: RuntimeConfig;
+  llm: LLMProvider;
+  /** Optional event bus override (useful for tests). */
+  eventBus?: EventBus<KernelEvents>;
+  /** Optional scheduler override (useful for tests). */
+  scheduler?: Scheduler;
+}
+
+/**
+ * KAIROS kernel: owns the event bus, sessions, scheduler, LLM provider and
+ * plugin registry, and coordinates their lifecycle.
+ */
+export class HermesRuntime {
+  readonly eventBus: EventBus<KernelEvents>;
+  readonly sessions: SessionManager;
+  readonly scheduler: Scheduler;
+  readonly llm: LLMProvider;
+  readonly plugins: PluginRegistry;
+  readonly config: RuntimeConfig;
+
+  #started = false;
+  #startedAt: number | null = null;
+
+  constructor(options: HermesRuntimeOptions) {
+    this.config = options.config;
+    this.eventBus = options.eventBus ?? new EventBus<KernelEvents>();
+    this.sessions = new SessionManager();
+    this.scheduler = options.scheduler ?? new Scheduler();
+    this.llm = options.llm;
+    this.plugins = new PluginRegistry({
+      onError: ({ plugin, error }) => {
+        this.eventBus.emit('plugin:error', { plugin, error });
+      },
+    });
+  }
+
+  /** Whether the runtime has been started and not yet stopped. */
+  get started(): boolean {
+    return this.#started;
+  }
+
+  /** Timestamp of the most recent `start()`, or `null`. */
+  get startedAt(): number | null {
+    return this.#startedAt;
+  }
+
+  /** Register a plugin with the runtime's registry. */
+  register(plugin: Plugin): void {
+    this.plugins.register(plugin);
+  }
+
+  /**
+   * Start the scheduler and initialize all registered plugins in order.
+   * Plugin init failures are collected and logged, never fatal.
+   */
+  async start(): Promise<void> {
+    if (this.#started) return;
+    this.#started = true;
+    this.#startedAt = Date.now();
+    this.eventBus.emit('runtime:config', { config: this.config });
+    this.scheduler.start();
+    await this.plugins.initAll({
+      eventBus: this.eventBus,
+      sessions: this.sessions,
+      scheduler: this.scheduler,
+      llm: this.llm,
+      config: this.config.plugins,
+      send: async (sessionId, content) => {
+        const message = this.sessions.appendMessage(sessionId, 'agent', content);
+        this.eventBus.emit('message:outbound', {
+          sessionId,
+          content,
+          timestamp: message.timestamp,
+        });
+        return message;
+      },
+    });
+    this.eventBus.emit('runtime:started', {});
+  }
+
+  /** Tear down all plugins in reverse order and stop the scheduler. */
+  async stop(): Promise<void> {
+    if (!this.#started) return;
+    await this.plugins.teardownAll();
+    this.scheduler.stop();
+    this.#started = false;
+    this.#startedAt = null;
+    this.eventBus.emit('runtime:stopped', {});
+  }
+}
