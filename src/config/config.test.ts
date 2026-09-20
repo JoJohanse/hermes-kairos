@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_TIME_WINDOWS } from '../builtins/proactive-chat/decision.js';
 import { DEFAULT_PERSONA_SYSTEM_PROMPT } from '../builtins/proactive-chat/prompts.js';
 import {
+  DEFAULT_HERMES_BRIDGE,
   DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   DEFAULT_PROACTIVE_CHAT,
   DEFAULT_STORAGE_DATA_DIR,
   loadConfig,
+  resolveHermesBridgeConfig,
   resolveProactiveChatConfig,
   type ConfigWarning,
 } from './config.js';
@@ -39,6 +41,7 @@ const RESOLVED_DEFAULTS = {
   delayedQueue: { maxSize: 10, maxAgeHours: 4 },
   persona: { systemPrompt: DEFAULT_PERSONA_SYSTEM_PROMPT },
   persistence: { enabled: true, saveIntervalTicks: 20 },
+  delivery: { mode: 'self' },
 };
 
 /** Collect warnings instead of letting them reach the console. */
@@ -298,6 +301,85 @@ describe('resolveProactiveChatConfig', () => {
     expect(resolved.heartbeat.intervalMs).toBe(45_000);
     expect(resolved.persistence).toEqual({ enabled: false, saveIntervalTicks: 5 });
   });
+
+  it('resolves delivery.mode and warns on an invalid value', () => {
+    expect(resolveProactiveChatConfig({ delivery: { mode: 'delegate' } }).delivery).toEqual({
+      mode: 'delegate',
+    });
+
+    const { warnings, onWarn } = collector();
+    const resolved = resolveProactiveChatConfig({ delivery: { mode: 'nope' } }, { onWarn });
+    expect(resolved.delivery).toEqual({ mode: 'self' });
+    expect(warnings.map((warning) => warning.field)).toEqual(['delivery.mode']);
+  });
+});
+
+describe('hermesBridge config', () => {
+  it('exposes disabled-by-default bridge defaults', () => {
+    expect(DEFAULT_HERMES_BRIDGE).toEqual({
+      enabled: false,
+      port: 8671,
+      host: '127.0.0.1',
+      token: '',
+      callbackUrl: 'http://127.0.0.1:8672/speak',
+      deliveryMode: 'turn',
+    });
+  });
+
+  it('fills defaults for an empty object and warns for non-object input', () => {
+    expect(resolveHermesBridgeConfig({})).toEqual(DEFAULT_HERMES_BRIDGE);
+
+    const { warnings, onWarn } = collector();
+    expect(resolveHermesBridgeConfig('nope', { onWarn })).toEqual(DEFAULT_HERMES_BRIDGE);
+    expect(warnings.map((warning) => warning.field)).toEqual(['hermesBridge']);
+  });
+
+  it('sanitizes malformed fields and warns once per field', () => {
+    const { warnings, onWarn } = collector();
+    const resolved = resolveHermesBridgeConfig(
+      { enabled: 'yes', port: 'nope', host: 5, callbackUrl: [], deliveryMode: 'shout' },
+      { onWarn },
+    );
+    expect(resolved).toEqual(DEFAULT_HERMES_BRIDGE);
+    expect(warnings.map((warning) => warning.field)).toEqual([
+      'hermesBridge.enabled',
+      'hermesBridge.port',
+      'hermesBridge.host',
+      'hermesBridge.callbackUrl',
+      'hermesBridge.deliveryMode',
+    ]);
+  });
+
+  it('accepts a fully valid bridge config with zero warnings', () => {
+    const { warnings, onWarn } = collector();
+    const resolved = resolveHermesBridgeConfig(
+      {
+        enabled: true,
+        port: 9000,
+        host: '0.0.0.0',
+        token: 'secret',
+        callbackUrl: 'http://example.test/speak',
+        deliveryMode: 'verbatim',
+      },
+      { onWarn },
+    );
+    expect(resolved).toEqual({
+      enabled: true,
+      port: 9000,
+      host: '0.0.0.0',
+      token: 'secret',
+      callbackUrl: 'http://example.test/speak',
+      deliveryMode: 'verbatim',
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns about an out-of-range port without rejecting it', () => {
+    const { warnings, onWarn } = collector();
+    const resolved = resolveHermesBridgeConfig({ port: 70000 }, { onWarn });
+    expect(resolved.port).toBe(70000);
+    expect(warnings.map((warning) => warning.field)).toEqual(['hermesBridge.port']);
+  });
 });
 
 describe('loadConfig', () => {
@@ -310,6 +392,30 @@ describe('loadConfig', () => {
     expect(config.llm.requestTimeoutMs).toBe(DEFAULT_LLM_REQUEST_TIMEOUT_MS);
     expect(config.storage.dataDir).toBe(DEFAULT_STORAGE_DATA_DIR);
     expect(config.plugins.proactiveChat.decision.sendThreshold).toBe(0.6);
+  });
+
+  it('includes hermesBridge defaults and deep-merges file overrides', () => {
+    const base = loadConfig({ configPath: missingConfigPath(), env: {} });
+    expect(base.hermesBridge).toEqual(DEFAULT_HERMES_BRIDGE);
+
+    const path = tempConfigPath(
+      JSON.stringify({ hermesBridge: { enabled: true, port: 9001, deliveryMode: 'verbatim' } }),
+    );
+    const config = loadConfig({ configPath: path, env: {} });
+    expect(config.hermesBridge).toEqual({
+      ...DEFAULT_HERMES_BRIDGE,
+      enabled: true,
+      port: 9001,
+      deliveryMode: 'verbatim',
+    });
+  });
+
+  it('treats a non-object hermesBridge section as ignored and warns', () => {
+    const path = tempConfigPath(JSON.stringify({ hermesBridge: 5 }));
+    const { warnings, onWarn } = collector();
+    const config = loadConfig({ configPath: path, env: {}, onWarn });
+    expect(config.hermesBridge).toEqual(DEFAULT_HERMES_BRIDGE);
+    expect(warnings.map((warning) => warning.field)).toEqual(['hermesBridge']);
   });
 
   it('parses the request timeout from the environment with a safe fallback', () => {

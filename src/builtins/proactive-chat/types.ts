@@ -134,6 +134,22 @@ export interface ProactiveContextConfig {
   historyTailMessages: number;
 }
 
+/**
+ * Who owns content generation for a proactive outreach.
+ *
+ * - `self`: this plugin asks the thought-engine LLM for content and delivers it
+ *   via `ctx.send` (the original, and default, behavior).
+ * - `delegate`: the plugin decides *whether* to reach out and emits a directive
+ *   for an external agent (e.g. the hermes-agent bridge) to compose and speak
+ *   the message itself. No thought-engine LLM call and no `ctx.send`.
+ */
+export type ProactiveDeliveryMode = 'self' | 'delegate';
+
+/** Delivery-mode configuration. */
+export interface ProactiveDeliveryConfig {
+  mode: ProactiveDeliveryMode;
+}
+
 /** Delayed (held) candidate queue configuration. */
 export interface ProactiveDelayedQueueConfig {
   maxSize: number;
@@ -160,6 +176,7 @@ export interface ProactiveChatResolvedConfig {
   delayedQueue: ProactiveDelayedQueueConfig;
   persona: ProactivePersonaConfig;
   persistence: ProactivePersistenceConfig;
+  delivery: ProactiveDeliveryConfig;
 }
 
 /** Payload for the `proactive:thought` event (emitted when a thought is sent). */
@@ -170,6 +187,20 @@ export interface ProactiveThoughtEvent {
   breakdown: DecisionBreakdown;
   stimuli: string[];
   timestamp: number;
+}
+
+/**
+ * Payload for the `proactive:delegate` event (delivery mode `delegate`).
+ *
+ * Emitted instead of `proactive:thought` when the plugin has decided to reach
+ * out but delegates composition/delivery to an external agent: `directive` is a
+ * plain-template instruction (no LLM) the delegate uses to author the message.
+ */
+export interface ProactiveDelegateEvent {
+  sessionId: string;
+  directive: string;
+  score: number;
+  breakdown: DecisionBreakdown;
 }
 
 /**

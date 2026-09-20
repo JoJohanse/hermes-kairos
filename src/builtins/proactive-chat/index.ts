@@ -18,6 +18,7 @@ import {
   type GuardrailInput,
 } from './decision.js';
 import { DelayedQueue } from './delayed-queue.js';
+import { buildDelegateDirective } from './delegate.js';
 import {
   applyUserMessageCoupling,
   clamp01,
@@ -36,6 +37,7 @@ import {
   type EmotionState,
   type HeldStub,
   type ProactiveChatSnapshot,
+  type ProactiveDeliveryMode,
   type ProactivePersistedSession,
   type ThoughtCandidate,
 } from './types.js';
@@ -143,6 +145,7 @@ export class ProactiveChatPlugin implements Plugin {
   #storage: JsonStore | undefined;
   #unsubscribeMessage: Unsubscribe | undefined;
   #heartbeatTicks = 0;
+  #heartbeatRunning = false;
   #stopped = false;
   readonly #sends = new Map<string, number[]>();
   readonly #nowFn: () => number;
@@ -176,6 +179,16 @@ export class ProactiveChatPlugin implements Plugin {
   /** Observability hook: tracked proactive send timestamps for a session. */
   sendTimestamps(sessionId: string): readonly number[] {
     return this.#sends.get(sessionId) ?? [];
+  }
+
+  /**
+   * Run one heartbeat evaluation immediately (scheduler-independent).
+   *
+   * Reentrancy-guarded so a manual trigger overlapping a scheduled tick is
+   * skipped rather than double-evaluating sessions. Used by the HTTP bridge.
+   */
+  async runOnce(): Promise<void> {
+    await this.#runHeartbeat();
   }
 
   init(ctx: PluginContext): void {
@@ -221,7 +234,7 @@ export class ProactiveChatPlugin implements Plugin {
     ctx.scheduler.registerTask({
       name: PROACTIVE_CHAT_TASK_NAME,
       intervalMs: config.heartbeat.intervalMs,
-      run: () => this.#heartbeat(),
+      run: () => this.#runHeartbeat(),
     });
     console.log(`[plugin] registered ${this.name}@${this.version}`);
   }
@@ -259,6 +272,20 @@ export class ProactiveChatPlugin implements Plugin {
         interactionSocialNeedReset: config.emotion.interactionSocialNeedReset,
       }),
     );
+  }
+
+  /**
+   * Reentrancy guard shared by the scheduler task and {@link runOnce}: a tick
+   * requested while another is in flight is dropped.
+   */
+  async #runHeartbeat(): Promise<void> {
+    if (this.#heartbeatRunning) return;
+    this.#heartbeatRunning = true;
+    try {
+      await this.#heartbeat();
+    } finally {
+      this.#heartbeatRunning = false;
+    }
   }
 
   /** One heartbeat tick: evaluate every candidate session. */
@@ -331,6 +358,15 @@ export class ProactiveChatPlugin implements Plugin {
     //    is the only place HOLD-band work spends an LLM call.
     const rescored = queue.rescore(session.id, () => decision.score, config.decision.sendThreshold);
     if (rescored.promoted.length > 0) {
+      if (this.#deliveryMode() === 'delegate') {
+        // Never deliver more than one proactive message per tick.
+        for (let i = 1; i < rescored.promoted.length; i += 1) {
+          const remaining = rescored.promoted[i];
+          if (remaining) queue.enqueue(remaining);
+        }
+        await this.#delegate(ctx, session, emotion, decision, now);
+        return;
+      }
       const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
       if (this.#stopped) return;
       // Never deliver more than one proactive message per tick.
@@ -373,6 +409,11 @@ export class ProactiveChatPlugin implements Plugin {
       return;
     }
 
+    if (this.#deliveryMode() === 'delegate') {
+      await this.#delegate(ctx, session, emotion, decision, now);
+      return;
+    }
+
     const result = await this.#tryGenerate(ctx, session, emotion, decision, now);
     if (this.#stopped) return;
     if (result === undefined) return;
@@ -381,6 +422,46 @@ export class ProactiveChatPlugin implements Plugin {
       return;
     }
     await this.#deliver(ctx, result.candidate);
+  }
+
+  /** Configured delivery mode (`self` when uninitialized). */
+  #deliveryMode(): ProactiveDeliveryMode {
+    return this.#config?.delivery.mode ?? 'self';
+  }
+
+  /**
+   * Delegate delivery: emit a plain-template directive for an external agent
+   * instead of calling the thought engine and `ctx.send`.
+   *
+   * The outreach still consumes a send slot (timestamp recorded, snapshot saved)
+   * so cooldown and hourly/daily caps apply exactly as they do in `self` mode.
+   */
+  async #delegate(
+    ctx: PluginContext,
+    session: Session,
+    emotion: EmotionState,
+    decision: DecisionResult,
+    now: number,
+  ): Promise<void> {
+    if (this.#stopped) return;
+    const directive = buildDelegateDirective({
+      sessionId: session.id,
+      emotion,
+      score: decision.score,
+      breakdown: decision.breakdown,
+      lastContactAt: session.lastActivityAt,
+      now,
+    });
+    ctx.eventBus.emit('proactive:delegate', {
+      sessionId: session.id,
+      directive,
+      score: decision.score,
+      breakdown: decision.breakdown,
+    });
+    const sends = this.#recentSends(session.id, now);
+    sends.push(now);
+    this.#sends.set(session.id, sends);
+    if (this.#config?.persistence.enabled) this.#save();
   }
 
   /** Build a bundle and ask the LLM for content; `undefined` if unbuildable. */

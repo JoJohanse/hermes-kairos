@@ -26,6 +26,7 @@ import {
   type EmotionState,
   type HeldStub,
   type ProactiveChatSnapshot,
+  type ProactiveDelegateEvent,
   type ProactiveHeldEvent,
   type ProactiveSkippedEvent,
   type ProactiveThoughtEvent,
@@ -114,6 +115,7 @@ interface BootResult {
   skipped: ProactiveSkippedEvent[];
   held: ProactiveHeldEvent[];
   thought: ProactiveThoughtEvent[];
+  delegate: ProactiveDelegateEvent[];
 }
 
 async function boot(options: BootOptions = {}): Promise<BootResult> {
@@ -129,12 +131,16 @@ async function boot(options: BootOptions = {}): Promise<BootResult> {
   const skipped: ProactiveSkippedEvent[] = [];
   const held: ProactiveHeldEvent[] = [];
   const thought: ProactiveThoughtEvent[] = [];
+  const delegate: ProactiveDelegateEvent[] = [];
   runtime.eventBus.on('message:outbound', (payload) => outbound.push(payload));
   runtime.eventBus.on('proactive:skipped', (payload) => skipped.push(payload as ProactiveSkippedEvent));
   runtime.eventBus.on('proactive:held', (payload) => held.push(payload as ProactiveHeldEvent));
   runtime.eventBus.on('proactive:thought', (payload) => thought.push(payload as ProactiveThoughtEvent));
+  runtime.eventBus.on('proactive:delegate', (payload) =>
+    delegate.push(payload as ProactiveDelegateEvent),
+  );
   await runtime.start();
-  return { runtime, plugin, llm, outbound, skipped, held, thought };
+  return { runtime, plugin, llm, outbound, skipped, held, thought, delegate };
 }
 
 /** Provider whose completion stays pending until the test resolves it. */
@@ -968,8 +974,7 @@ describe('ProactiveChatPlugin (integration)', () => {
       plugin.teardown();
     });
 
-    it('ignores a snapshot with an unsupported version', () => {
-      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
+    it('ignores a snapshot with an unsupported version', () => {      const now = new Date(2026, 0, 15, 12, 0, 0).getTime();
       vi.setSystemTime(now);
       const fs = new MemoryFs();
       writeSnapshot(fs, {
@@ -990,6 +995,81 @@ describe('ProactiveChatPlugin (integration)', () => {
       } finally {
         warn.mockRestore();
       }
+    });
+  });
+
+  describe('delegate delivery mode', () => {
+    it('emits a directive instead of calling the LLM or ctx.send on GENERATE', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0));
+      const llm = new MockProvider({ response: 'should not be used' });
+      const { runtime, outbound, delegate } = await boot({
+        slice: pluginSlice({ delivery: { mode: 'delegate' } }),
+        provider: llm,
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi there');
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+
+      expect(delegate).toHaveLength(1);
+      expect(delegate[0]?.sessionId).toBe(session.id);
+      expect(delegate[0]?.directive).toContain(session.id);
+      expect(delegate[0]?.directive).toContain('Time since last contact');
+      expect(delegate[0]?.directive).toContain('socialNeed');
+      expect(llm.requests).toHaveLength(0);
+      expect(outbound).toHaveLength(0);
+      expect(session.messages.filter((message) => message.role === 'agent')).toHaveLength(0);
+
+      await runtime.stop();
+    });
+
+    it('delegates a promoted HOLD stub without an LLM call', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const llm = new MockProvider({ response: 'unused' });
+      const { runtime, outbound, held, delegate } = await boot({
+        slice: holdSlice({
+          delayedQueue: { maxSize: 10, maxAgeHours: 24 },
+          delivery: { mode: 'delegate' },
+        }),
+        provider: llm,
+      });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi');
+
+      // 08:30 → HOLD: stub queued, no delegation yet.
+      vi.setSystemTime(new Date(2026, 0, 15, 8, 30, 0));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(held).toHaveLength(1);
+      expect(delegate).toHaveLength(0);
+
+      // 18:00 → promotion: delegate instead of generating content.
+      vi.setSystemTime(new Date(2026, 0, 15, 18, 0, 0));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(delegate).toHaveLength(1);
+      expect(delegate[0]?.sessionId).toBe(session.id);
+      expect(llm.requests).toHaveLength(0);
+      expect(outbound).toHaveLength(0);
+
+      await runtime.stop();
+    });
+
+    it('runOnce forces an immediate evaluation tick', async () => {
+      vi.setSystemTime(new Date(2026, 0, 15, 3, 0, 0));
+      const { runtime, outbound, plugin } = await boot({ slice: pluginSlice() });
+
+      const session = runtime.sessions.create();
+      runtime.sessions.appendMessage(session.id, 'user', 'hi');
+
+      // No timers advanced: only the explicit trigger should evaluate.
+      vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+      await plugin.runOnce();
+
+      expect(outbound).toHaveLength(1);
+      expect(outbound[0]?.sessionId).toBe(session.id);
+
+      await runtime.stop();
     });
   });
 });

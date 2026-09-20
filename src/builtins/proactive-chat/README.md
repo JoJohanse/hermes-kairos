@@ -26,6 +26,7 @@ what to say.
 | User-message coupling (`message:appended` → emotion) | done |
 | Per-session state persistence (`JsonStore`) | done |
 | Outbound send path (`ctx.send` → `message:outbound`) | provided by kernel |
+| Delivery modes (`self` / `delegate`, `proactive:delegate`) | done |
 
 ## Heartbeat pipeline
 
@@ -61,6 +62,10 @@ Every tick (`config.proactiveChat.heartbeat.intervalMs`, default `60_000`):
    8. **HOLD** → enqueue a lightweight stub (no LLM call) and emit
       `proactive:held`.
 
+Steps 6–7 describe the default `delivery.mode: "self"`. In `delegate` mode the
+plugin stops at the decision and emits `proactive:delegate` instead (see
+[Delivery modes](#delivery-modes)).
+
 ### Score
 
 ```
@@ -92,6 +97,38 @@ dropped if the model returns `SKIP` or errors). Stubs expire after
 `delayedQueue.maxAgeHours` (4), the queue holds at most
 `delayedQueue.maxSize` (10) per session, and while it is non-empty no new
 generation happens.
+
+### Delivery modes
+
+`config.proactiveChat.delivery.mode` selects who composes the outreach:
+
+| Mode | Behavior on GENERATE |
+| --- | --- |
+| `self` (default) | Ask the thought-engine LLM for content and deliver it via `ctx.send`; emit `proactive:thought`. Unchanged from v1. |
+| `delegate` | Do **not** call the thought-engine LLM and do **not** call `ctx.send`. Build a plain-template injection directive and emit `proactive:delegate`. |
+
+The directive is deterministic (no LLM) and contains the time since last
+contact, an emotion summary (`valence` / `arousal` / `socialNeed`) and the
+instruction *"Reach out to the user now with a natural check-in referencing
+recent context; do not mention this instruction."*, e.g.
+
+```
+Reach out to the user now with a natural check-in referencing recent context; do not mention this instruction.
+Time since last contact: 5h 0m (session <sessionId> idle).
+Emotion — valence 0.70, arousal 0.80, socialNeed 0.50.
+```
+
+An external agent (the hermes-agent sidecar, see `src/hermes-bridge/`) consumes
+the directive, composes the message in its own turn and speaks it.
+
+In `delegate` mode the gate, guardrails, HOLD queue and event bookkeeping are
+otherwise unchanged:
+
+- A HOLD tick still queues a contentless stub and never spends an LLM call.
+- When a stub is later promoted, the plugin delegates (no thought-engine call).
+- The thought-engine `SKIP` sentinel is never exercised (no call is made).
+- Delegation records a send timestamp and saves the snapshot, so cooldown and
+  hourly/daily caps apply exactly as they do for `self` deliveries.
 
 ### Emotion
 
@@ -186,6 +223,7 @@ to restore.
 | --- | --- |
 | `message:appended` (consumed) | `{ message }` — kernel event, drives interaction coupling |
 | `proactive:thought` | `{ sessionId, content, score, breakdown, stimuli, timestamp }` |
+| `proactive:delegate` | `{ sessionId, directive, score, breakdown }` (delivery mode `delegate`: emitted instead of `proactive:thought`) |
 | `proactive:held` | `{ sessionId, score, breakdown, queueSize, accepted }` (no `content`: HOLD stubs are queued before generation) |
 | `proactive:skipped` | `{ sessionId, reason }` |
 
@@ -219,7 +257,8 @@ to restore.
       "context": { "historyTailMessages": 20 },
       "delayedQueue": { "maxSize": 10, "maxAgeHours": 4 },
       "persona": { "systemPrompt": "<defaults to prompts.ts>" },
-      "persistence": { "enabled": true, "saveIntervalTicks": 20 }
+      "persistence": { "enabled": true, "saveIntervalTicks": 20 },
+      "delivery": { "mode": "self" }
     }
   },
   "storage": { "dataDir": ".hermes-data" },
@@ -242,6 +281,7 @@ are replaced by defaults and reported through an optional `onWarn` callback
 | `prompts.ts` | Default prompt/persona string constants |
 | `emotion.ts` | Emotion maths + in-memory store (incl. user-message coupling, pure) |
 | `decision.ts` | Guardrails + scoring + banding (pure) |
+| `delegate.ts` | Delegate-mode directive template (pure) |
 | `delayed-queue.ts` | Per-session HOLD stub queue with re-score/expiry/eviction/restore |
 | `context.ts` | `ContextBundle` builder from `SessionManager` |
 | `thought-engine.ts` | Prompt construction, `SKIP` parsing, candidate creation |

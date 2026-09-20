@@ -4,6 +4,7 @@ import { DEFAULT_PERSONA_SYSTEM_PROMPT } from '../builtins/proactive-chat/prompt
 import { DEFAULT_TIME_WINDOWS } from '../builtins/proactive-chat/decision.js';
 import type {
   ProactiveChatResolvedConfig,
+  ProactiveDeliveryMode,
   ProactiveTimeWindow,
 } from '../builtins/proactive-chat/types.js';
 
@@ -82,11 +83,51 @@ export interface ProactiveChatConfig extends ProactiveChatResolvedConfig {
   allowNewSessions?: boolean;
 }
 
+/** Delivery mode understood by the HTTP bridge entry (`hermesBridge.deliveryMode`). */
+export type HermesBridgeDeliveryMode = 'turn' | 'verbatim';
+
+/** HTTP bridge entry configuration (`hermesBridge` root slice). */
+export interface HermesBridgeConfig {
+  /** When false the bridge entry refuses to start (default). */
+  enabled: boolean;
+  /** TCP port to bind. */
+  port: number;
+  /** Interface to bind. */
+  host: string;
+  /** Shared secret; when non-empty every route requires `Authorization: Bearer <token>`. */
+  token: string;
+  /** URL the bridge POSTs proactive callbacks to (the hermes-agent side). */
+  callbackUrl: string;
+  /**
+   * Maps to the plugin's `proactiveChat.delivery.mode`:
+   * `turn` → `delegate` (agent composes the message), `verbatim` → `self`.
+   */
+  deliveryMode: HermesBridgeDeliveryMode;
+}
+
+/** Default HTTP bridge configuration. Disabled unless explicitly enabled. */
+export const DEFAULT_HERMES_BRIDGE: HermesBridgeConfig = {
+  enabled: false,
+  port: 8671,
+  host: '127.0.0.1',
+  token: '',
+  callbackUrl: 'http://127.0.0.1:8672/speak',
+  deliveryMode: 'turn',
+};
+
+/** Options for {@link resolveHermesBridgeConfig}. */
+export interface ResolveHermesBridgeConfigOptions {
+  /** Warning sink for silently-rejected fields. Defaults to `console.warn`. */
+  onWarn?: ConfigWarnHandler;
+}
+
 /** Fully resolved KAIROS configuration. */
 export interface HermesConfig {
   llm: LLMConfig;
   /** Kernel storage location for plugin JSON state. */
   storage: { dataDir: string };
+  /** HTTP sidecar bridge entry configuration. */
+  hermesBridge: HermesBridgeConfig;
   plugins: {
     proactiveChat: ProactiveChatConfig;
     [plugin: string]: unknown;
@@ -137,6 +178,7 @@ export const DEFAULT_PROACTIVE_CHAT: ProactiveChatConfig = {
   delayedQueue: { maxSize: 10, maxAgeHours: 4 },
   persona: { systemPrompt: DEFAULT_PERSONA_SYSTEM_PROMPT },
   persistence: { enabled: true, saveIntervalTicks: DEFAULT_PERSISTENCE_SAVE_INTERVAL_TICKS },
+  delivery: { mode: 'self' },
   // Deprecated placeholders retained so existing config files keep parsing.
   checkIntervalMs: 60_000,
   idleThresholdMs: 5 * 60_000,
@@ -372,6 +414,106 @@ function timeWindowsFrom(value: unknown, fallback: ProactiveTimeWindow[]): Proac
   return windows.length > 0 ? windows : [...fallback];
 }
 
+function stringAllowEmptyFrom(
+  source: Record<string, unknown>,
+  key: string,
+  fallback: string,
+  warn: ConfigWarnHandler,
+  field: string,
+): string {
+  const value = source[key];
+  if (value === undefined) return fallback;
+  if (typeof value === 'string') return value;
+  warn({ field, value, reason: 'expected a string; using default' });
+  return fallback;
+}
+
+/** Parse a proactive delivery mode (`self` | `delegate`). */
+function proactiveDeliveryModeFrom(
+  source: Record<string, unknown>,
+  key: string,
+  fallback: ProactiveDeliveryMode,
+  warn: ConfigWarnHandler,
+  field: string,
+): ProactiveDeliveryMode {
+  const value = source[key];
+  if (value === undefined) return fallback;
+  if (value === 'self' || value === 'delegate') return value;
+  warn({ field, value, reason: "expected 'self' or 'delegate'; using default" });
+  return fallback;
+}
+
+/** Parse a bridge delivery mode (`turn` | `verbatim`). */
+function bridgeDeliveryModeFrom(
+  source: Record<string, unknown>,
+  key: string,
+  fallback: HermesBridgeDeliveryMode,
+  warn: ConfigWarnHandler,
+  field: string,
+): HermesBridgeDeliveryMode {
+  const value = source[key];
+  if (value === undefined) return fallback;
+  if (value === 'turn' || value === 'verbatim') return value;
+  warn({ field, value, reason: "expected 'turn' or 'verbatim'; using default" });
+  return fallback;
+}
+
+/**
+ * Resolve a raw `hermesBridge` config slice, defaulting and warning on every
+ * malformed field (the same instrumentation contract as the plugin slices).
+ */
+export function resolveHermesBridgeConfig(
+  raw: unknown,
+  options: ResolveHermesBridgeConfigOptions = {},
+): HermesBridgeConfig {
+  const warn = options.onWarn ?? defaultConfigWarn;
+  const defaults = DEFAULT_HERMES_BRIDGE;
+
+  if (raw !== undefined && !isPlainObject(raw)) {
+    warn({ field: 'hermesBridge', value: raw, reason: 'expected an object; using defaults' });
+  }
+  const root = asObject(raw);
+
+  const enabled = booleanFrom(root, 'enabled', defaults.enabled);
+  if (root['enabled'] !== undefined && typeof root['enabled'] !== 'boolean') {
+    warn({
+      field: 'hermesBridge.enabled',
+      value: root['enabled'],
+      reason: 'expected a boolean; using default',
+    });
+  }
+
+  const port = numberField(root, 'port', defaults.port, warn, 'hermesBridge.port');
+  warnIf(
+    warn,
+    'hermesBridge.port',
+    port,
+    port < 1 || port > 65535,
+    'expected a port in 1..65535',
+  );
+
+  return {
+    enabled,
+    port,
+    host: stringAllowEmptyFrom(root, 'host', defaults.host, warn, 'hermesBridge.host'),
+    token: stringAllowEmptyFrom(root, 'token', defaults.token, warn, 'hermesBridge.token'),
+    callbackUrl: stringAllowEmptyFrom(
+      root,
+      'callbackUrl',
+      defaults.callbackUrl,
+      warn,
+      'hermesBridge.callbackUrl',
+    ),
+    deliveryMode: bridgeDeliveryModeFrom(
+      root,
+      'deliveryMode',
+      defaults.deliveryMode,
+      warn,
+      'hermesBridge.deliveryMode',
+    ),
+  };
+}
+
 /**
  * Resolve a raw `proactiveChat` config slice into the full plugin configuration.
  *
@@ -412,6 +554,7 @@ export function resolveProactiveChatConfig(
   const delayedQueue = asObject(root['delayedQueue']);
   const persona = asObject(root['persona']);
   const persistence = asObject(root['persistence']);
+  const delivery = asObject(root['delivery']);
   const quietHours = asObject(decision['quietHours']);
 
   const intervalMs = intervalField(heartbeat, root, warn);
@@ -619,6 +762,9 @@ export function resolveProactiveChatConfig(
         'persistence.saveIntervalTicks',
       ),
     },
+    delivery: {
+      mode: proactiveDeliveryModeFrom(delivery, 'mode', defaults.delivery.mode, warn, 'delivery.mode'),
+    },
   };
 }
 
@@ -647,6 +793,7 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
       requestTimeoutMs: timeoutFromEnv(env.LLM_REQUEST_TIMEOUT_MS, warn),
     },
     storage: { dataDir: DEFAULT_STORAGE_DATA_DIR },
+    hermesBridge: { ...DEFAULT_HERMES_BRIDGE },
     plugins: {
       proactiveChat: cleanPluginDefaults,
     },
@@ -668,7 +815,7 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
   // Sections the loader expects to be objects: a wrong-typed section is ignored
   // wholesale (deep-merge would otherwise treat it as a scalar override), so
   // surface it rather than silently dropping it.
-  for (const section of ['plugins', 'llm', 'storage'] as const) {
+  for (const section of ['plugins', 'llm', 'storage', 'hermesBridge'] as const) {
     const value = parsed[section];
     if (value !== undefined && !isPlainObject(value)) {
       warn({ field: section, value, reason: 'not an object; section ignored' });
@@ -695,6 +842,9 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
   const mergedLlm: Record<string, unknown> = isPlainObject(merged.llm) ? merged.llm : {};
   const mergedStorage: Record<string, unknown> = isPlainObject(merged.storage)
     ? merged.storage
+    : {};
+  const mergedBridge: Record<string, unknown> = isPlainObject(merged.hermesBridge)
+    ? merged.hermesBridge
     : {};
   const rawDataDir = mergedStorage['dataDir'];
   let dataDir = DEFAULT_STORAGE_DATA_DIR;
@@ -731,6 +881,7 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
       requestTimeoutMs,
     },
     storage: { dataDir },
+    hermesBridge: resolveHermesBridgeConfig(mergedBridge, { onWarn: warn }),
     plugins: {
       ...plugins,
       proactiveChat: proactive,

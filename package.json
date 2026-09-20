@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
+    "bridge": "tsx src/hermes-bridge/main.ts",
     "test": "vitest run"
   },
   "devDependencies": {
