@@ -4,6 +4,8 @@
 
 [English](README.md) | **中文**
 
+![KAIROS —— 思考 · 记忆 · 发起对话](docs/images/banner-zh.jpg)
+
 **KAIROS**（Autonomous Initiative and Response Orchestration System 内核）是一个小型、零依赖的 agent 运行时，用于构建能**主动发起**对话而不仅是被动应答的智能体。内核提供自治 agent 所需的共享服务——类型化事件总线、内存态会话/消息存储、带重叠保护的间隔调度器、可插拔 LLM Provider、故障隔离的插件注册表——并把所有行为委托给插件；首个内置插件是**主动性对话**插件，决定 agent 何时应该主动开口。
 
 ## 目录
@@ -83,6 +85,17 @@ npm test         # vitest run（测试与源码同目录，*.test.ts）
 ## 在 hermes-agent 中安装本插件
 
 本仓库自带一个 [hermes-agent](https://github.com/NousResearch/hermes-agent) 原生插件（`hermes-plugin/kairos/`），把 proactive-chat 的主动性对话能力以 hermes 插件形式接入：插件自动拉起并监管 kairos sidecar（`src/hermes-bridge/`），把 hermes 的会话活动喂给 KAIROS 门控，在合适时机通过 `ctx.inject_message()` 主动发起对话。
+
+### 实拍效果
+
+来自我们 hermes-agent 测试环境的真实会话——晚上聊到 ONE OK ROCK…
+
+| …次日清晨，kairos 自己打开了话题 |
+| --- |
+| ![晚上：关于 ONE OK ROCK 的对话](docs/images/chat-conversation.png) |
+| ![次日清晨：主动问候](docs/images/chat-proactive.png) |
+
+*（清晨消息记得昨晚的话题，推荐了《DETOX》专辑里的曲目，还附了一条行情提示——内容由 hermes 的 LLM 生成，时机由 KAIROS 门控决定。）*
 
 > English guide: [README.md](README.md#install-as-a-hermes-agent-plugin)。
 

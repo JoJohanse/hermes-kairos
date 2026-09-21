@@ -4,6 +4,8 @@
 
 **English** | [中文](README_zh.md)
 
+![KAIROS — Think · Memory · Conversation](docs/images/banner-en.jpg)
+
 **KAIROS** (Kernel for Autonomous Initiative and Response Orchestration System) is a small, dependency-free agent runtime for building agents that *start* conversations rather than only answer them. The kernel supplies the shared services an autonomous agent needs — a typed event bus, in-memory session/message storage, an interval scheduler with overlap protection, a pluggable LLM provider, and a failure-isolated plugin registry — and delegates all behavior to plugins; the first of them is a **proactive-conversation** plugin that decides when the agent should speak up on its own.
 
 ## Contents
@@ -83,6 +85,17 @@ npm test         # vitest run (colocated *.test.ts)
 ## Install as a hermes-agent plugin
 
 This repo ships a native [hermes-agent](https://github.com/NousResearch/hermes-agent) plugin (`hermes-plugin/kairos/`) that exposes the proactive-conversation capability through the official hermes plugin contract: the plugin spawns and supervises the kairos sidecar (`src/hermes-bridge/`), feeds hermes session activity into the KAIROS gate, and at the right moment calls `ctx.inject_message()` so hermes starts a conversation on its own.
+
+### See it in action
+
+A real session from our hermes-agent test environment — you talk about ONE OK ROCK in the evening…
+
+| …and the next morning, kairos opens the conversation itself |
+| --- |
+| ![Evening: a conversation about ONE OK ROCK](docs/images/chat-conversation.png) |
+| ![Next morning: the proactive reach-out](docs/images/chat-proactive.png) |
+
+*(The morning message remembers yesterday's topic, recommends tracks from the 《DETOX》 album, and adds a market note — authored by hermes's LLM, triggered by the KAIROS gate.)*
 
 > 中文安装指南见 [README_zh.md](README_zh.md)。
 
