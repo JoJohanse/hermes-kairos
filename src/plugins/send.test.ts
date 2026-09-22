@@ -47,3 +47,26 @@ describe('PluginContext.send', () => {
     expect(runtime.scheduler.started).toBe(false);
   });
 });
+
+describe('runtime.send (the speak path)', () => {
+  it('is the same seam as ctx.send: appends the agent message and emits message:outbound', async () => {
+    const runtime = new HermesRuntime({ config: CONFIG, llm: new MockProvider() });
+    const session = runtime.sessions.create();
+    const appended: string[] = [];
+    const outbound: string[] = [];
+    runtime.eventBus.on('message:appended', ({ message }) => {
+      appended.push(`${message.role}:${message.content}`);
+    });
+    runtime.eventBus.on('message:outbound', ({ content }) => {
+      outbound.push(content);
+    });
+
+    const message = await runtime.send(session.id, 'host-composed reply');
+
+    expect(message.role).toBe('agent');
+    expect(message.content).toBe('host-composed reply');
+    expect(session.messages).toEqual([message]);
+    expect(appended).toEqual(['agent:host-composed reply']);
+    expect(outbound).toEqual(['host-composed reply']);
+  });
+});

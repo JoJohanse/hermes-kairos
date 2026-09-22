@@ -48,6 +48,40 @@ export function clamp01(value: number): number {
   return value;
 }
 
+/** A finite number inside the closed unit interval `[0, 1]`. */
+function isUnitInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/** Whether a value is a well-formed {@link EmotionState} (every field in `[0, 1]`). */
+export function isEmotionState(value: unknown): value is EmotionState {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    isUnitInterval(record['valence']) &&
+    isUnitInterval(record['arousal']) &&
+    isUnitInterval(record['socialNeed'])
+  );
+}
+
+/** Clamp every emotion field into `[0, 1]` (defense in depth on restore). */
+export function clampEmotionState(state: EmotionState): EmotionState {
+  return {
+    valence: clamp01(state.valence),
+    arousal: clamp01(state.arousal),
+    socialNeed: clamp01(state.socialNeed),
+  };
+}
+
+/** Whether a state is exactly the pristine default (i.e. carries no signal). */
+export function isDefaultEmotion(state: EmotionState): boolean {
+  return (
+    state.valence === DEFAULT_EMOTION_STATE.valence &&
+    state.arousal === DEFAULT_EMOTION_STATE.arousal &&
+    state.socialNeed === DEFAULT_EMOTION_STATE.socialNeed
+  );
+}
+
 /**
  * Advance an emotion state by `elapsedMs` of pure wall-clock time.
  *

@@ -646,6 +646,36 @@ def _log_injection_failure(
 # ---------------------------------------------------------------------------
 
 
+def _parse_pidfile_pid(raw: str) -> Optional[int]:
+    """Extract the recorded pid from a pidfile body (contract.json ``pidfile.body``).
+
+    Canonical form is the JSON ``{"pid": <positive int>, "nonce": <str>}`` the TS
+    sidecar writes; bare ``<pid>`` or ``<pid> <nonce>`` is tolerated so an
+    older/other-language writer still enables recovery. Returns None when the body
+    is malformed or the pid is not a positive integer.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        pid = parsed.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        return pid
+    head = text.split(None, 1)[0]
+    try:
+        pid = int(head)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
 def _pid_alive(pid: int) -> bool:
     """Best-effort liveness probe. Never uses ``os.kill(pid, 0)`` on Windows (it would
     TerminateProcess the target); uses OpenProcess/GetExitCodeProcess instead."""
@@ -804,11 +834,7 @@ class SidecarProcess:
                 raw = handle.read().strip()
         except Exception:
             return None
-        try:
-            pid = int(raw)
-        except (TypeError, ValueError):
-            return None
-        return pid if pid > 0 else None
+        return _parse_pidfile_pid(raw)
 
     def _recover_orphan(self) -> None:
         """Kill a live orphan named by the pidfile when our health probe fails, then retry."""

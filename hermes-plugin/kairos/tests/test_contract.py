@@ -26,7 +26,7 @@ CONTRACT = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
 def test_contract_fixture_shape():
     assert CONTRACT["version"] == 1
-    for section in ("transport", "auth", "routes", "nonce", "sidecarArgv", "speakPayloads", "eventPayloads"):
+    for section in ("transport", "auth", "routes", "nonce", "sidecarArgv", "speakPayloads", "eventPayloads", "pidfile"):
         assert section in CONTRACT
 
 
@@ -152,13 +152,45 @@ def test_nonce_handshake_matches_fixture(monkeypatch):
 
 
 def test_pidfile_and_datadir_fields_match_fixture():
-    assert CONTRACT["pidfile"] == bridge.PIDFILE_NAME
+    assert CONTRACT["pidfile"]["filename"] == bridge.PIDFILE_NAME
+    assert CONTRACT["pidfile"]["writer"] == "sidecar"
     data_dir = CONTRACT["dataDir"]
     assert data_dir["envOverride"] == "HERMES_HOME"
     assert data_dir["hermesHomeSuffix"] == bridge.DEFAULT_DATA_DIR_NAME
     assert bridge.default_data_dir({"HERMES_HOME": "/srv/hermes"}).endswith(
         bridge.DEFAULT_DATA_DIR_NAME
     )
+
+
+def test_contract_mirror_is_byte_identical():
+    ts_mirror = PLUGIN_DIR.parent.parent / "src" / "hermes-bridge" / "contract.json"
+    assert ts_mirror.is_file(), f"missing TS mirror: {ts_mirror}"
+    assert ts_mirror.read_bytes() == CONTRACT_PATH.read_bytes()
+
+
+def test_pidfile_body_format_matches_fixture(tmp_path):
+    """The plugin's orphan-recovery read must accept the body the sidecar actually
+    writes: the canonical JSON shape named by the contract, plus the legacy forms."""
+    body = CONTRACT["pidfile"]["body"]
+    assert body["format"] == "json"
+    canonical = body["canonicalExample"]
+
+    def read_pid(raw: str):
+        pid_file = tmp_path / "sidecar.pid"
+        pid_file.write_text(raw, encoding="utf-8")
+        sidecar = bridge.SidecarProcess(
+            ["node", "main.js"], 8671, log=lambda _m: None, pid_file=str(pid_file),
+        )
+        return sidecar._read_pidfile()
+
+    assert read_pid(canonical) == 1234
+    for legacy in body["legacyTolerated"]:
+        assert read_pid(legacy.replace("<pid>", "1234").replace("<nonce>", "abc")) == 1234
+    assert read_pid('{"pid": -5, "nonce": "x"}') is None
+    assert read_pid('{"pid": "4242", "nonce": "x"}') is None
+    assert read_pid("{ not json") is None
+    assert read_pid("garbage") is None
+    assert read_pid("") is None
 
 
 if __name__ == "__main__":  # pragma: no cover

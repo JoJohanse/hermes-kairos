@@ -14,6 +14,7 @@ import {
   defaultConfigWarn,
   numberField,
   stringFrom,
+  warnIf,
   type ConfigWarnHandler,
 } from '../../config/fields.js';
 import { DEFAULT_TIME_WINDOWS } from './decision.js';
@@ -93,16 +94,6 @@ export const DEFAULT_PROACTIVE_CHAT: ProactiveChatConfig = {
 
 const MINUTE_MS = 60_000;
 
-function warnIf(
-  warn: ConfigWarnHandler,
-  field: string,
-  value: unknown,
-  condition: boolean,
-  reason: string,
-): void {
-  if (condition) warn({ field, value, reason });
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -111,112 +102,63 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
-/** Resolve `heartbeat.intervalMs` with its deprecated `checkIntervalMs` fallback. */
-function intervalField(
-  heartbeat: Record<string, unknown>,
-  root: Record<string, unknown>,
-  warn: ConfigWarnHandler,
-): number {
-  const primary = heartbeat['intervalMs'];
-  if (primary !== undefined) {
-    if (isFiniteNumber(primary) && primary > 0) {
-      if (root['checkIntervalMs'] !== undefined) {
-        warn({
-          field: 'checkIntervalMs',
-          value: root['checkIntervalMs'],
-          reason: 'deprecated; ignored because heartbeat.intervalMs is set',
-        });
-      }
-      return primary;
-    }
-    warn({
-      field: 'heartbeat.intervalMs',
-      value: primary,
-      reason: 'must be a positive finite number',
-    });
-  }
-  const legacy = root['checkIntervalMs'];
-  if (legacy !== undefined) {
-    if (isFiniteNumber(legacy) && legacy > 0) return legacy;
-    warn({
-      field: 'checkIntervalMs',
-      value: legacy,
-      reason: 'must be a positive finite number; using default',
-    });
-  }
-  return DEFAULT_PROACTIVE_CHAT.heartbeat.intervalMs;
+function isPositiveFinite(value: unknown): value is number {
+  return isFiniteNumber(value) && value > 0;
 }
 
-/** Resolve `decision.noSendAfterActivityMinutes` with its `idleThresholdMs` fallback. */
-function noSendField(
-  decision: Record<string, unknown>,
-  root: Record<string, unknown>,
+/**
+ * One field-resolution pattern for a replacement field with a deprecated
+ * root-level alias: the replacement wins when valid, the alias is honored only
+ * when the replacement is absent, and every rejection warns. A fourth
+ * deprecated field is one more declaration of this pattern, not another copy.
+ */
+function fieldWithDeprecatedFallback(
+  options: {
+    /** Section object holding the replacement field. */
+    section: Record<string, unknown>;
+    /** Replacement field key inside `section`. */
+    key: string;
+    /** Dotted label used in warnings for the replacement. */
+    label: string;
+    /** Whether the replacement value is usable. */
+    isValid: (value: unknown) => value is number;
+    /** Warning reason when the replacement is present but unusable. */
+    invalidReason: string;
+    /** Raw root object holding the deprecated alias. */
+    root: Record<string, unknown>;
+    /** Deprecated alias key. */
+    legacyKey: string;
+    /** Whether the alias value is usable. */
+    legacyIsValid: (value: unknown) => value is number;
+    /** Convert a usable alias value into the replacement's unit. */
+    convertLegacy: (value: number) => number;
+    /** Warning reason when the alias is present but unusable. */
+    legacyInvalidReason: string;
+    /** Fallback when neither field is usable. */
+    fallback: number;
+  },
   warn: ConfigWarnHandler,
 ): number {
-  const primary = decision['noSendAfterActivityMinutes'];
-  const legacy = root['idleThresholdMs'];
+  const primary = options.section[options.key];
+  const legacy = options.root[options.legacyKey];
   if (primary !== undefined) {
-    if (isFiniteNumber(primary)) {
+    if (options.isValid(primary)) {
       if (legacy !== undefined) {
         warn({
-          field: 'idleThresholdMs',
+          field: options.legacyKey,
           value: legacy,
-          reason: 'deprecated; ignored because decision.noSendAfterActivityMinutes is set',
+          reason: `deprecated; ignored because ${options.label} is set`,
         });
       }
       return primary;
     }
-    warn({
-      field: 'decision.noSendAfterActivityMinutes',
-      value: primary,
-      reason: 'expected a finite number; using fallback',
-    });
+    warn({ field: options.label, value: primary, reason: options.invalidReason });
   }
   if (legacy !== undefined) {
-    if (isFiniteNumber(legacy)) return legacy / MINUTE_MS;
-    warn({
-      field: 'idleThresholdMs',
-      value: legacy,
-      reason: 'expected a finite number of milliseconds; using default',
-    });
+    if (options.legacyIsValid(legacy)) return options.convertLegacy(legacy);
+    warn({ field: options.legacyKey, value: legacy, reason: options.legacyInvalidReason });
   }
-  return DEFAULT_PROACTIVE_CHAT.decision.noSendAfterActivityMinutes;
-}
-
-/** Resolve `decision.maxPerHour` with its `maxInitiationsPerHour` fallback. */
-function maxPerHourField(
-  decision: Record<string, unknown>,
-  root: Record<string, unknown>,
-  warn: ConfigWarnHandler,
-): number {
-  const primary = decision['maxPerHour'];
-  const legacy = root['maxInitiationsPerHour'];
-  if (primary !== undefined) {
-    if (isFiniteNumber(primary)) {
-      if (legacy !== undefined) {
-        warn({
-          field: 'maxInitiationsPerHour',
-          value: legacy,
-          reason: 'deprecated; ignored because decision.maxPerHour is set',
-        });
-      }
-      return primary;
-    }
-    warn({
-      field: 'decision.maxPerHour',
-      value: primary,
-      reason: 'expected a finite number; using fallback',
-    });
-  }
-  if (legacy !== undefined) {
-    if (isFiniteNumber(legacy)) return legacy;
-    warn({
-      field: 'maxInitiationsPerHour',
-      value: legacy,
-      reason: 'expected a finite number; using default',
-    });
-  }
-  return DEFAULT_PROACTIVE_CHAT.decision.maxPerHour;
+  return options.fallback;
 }
 
 function timeWindowsFrom(value: unknown, fallback: ProactiveTimeWindow[]): ProactiveTimeWindow[] {
@@ -301,9 +243,54 @@ export function resolveProactiveChatConfig(
   const delivery = asObject(root['delivery']);
   const quietHours = asObject(decision['quietHours']);
 
-  const intervalMs = intervalField(heartbeat, root, warn);
-  const noSendAfterActivityMinutes = noSendField(decision, root, warn);
-  const maxPerHour = maxPerHourField(decision, root, warn);
+  const intervalMs = fieldWithDeprecatedFallback(
+    {
+      section: heartbeat,
+      key: 'intervalMs',
+      label: 'heartbeat.intervalMs',
+      isValid: isPositiveFinite,
+      invalidReason: 'must be a positive finite number',
+      root,
+      legacyKey: 'checkIntervalMs',
+      legacyIsValid: isPositiveFinite,
+      convertLegacy: (value) => value,
+      legacyInvalidReason: 'must be a positive finite number; using default',
+      fallback: defaults.heartbeat.intervalMs,
+    },
+    warn,
+  );
+  const noSendAfterActivityMinutes = fieldWithDeprecatedFallback(
+    {
+      section: decision,
+      key: 'noSendAfterActivityMinutes',
+      label: 'decision.noSendAfterActivityMinutes',
+      isValid: isFiniteNumber,
+      invalidReason: 'expected a finite number; using fallback',
+      root,
+      legacyKey: 'idleThresholdMs',
+      legacyIsValid: isFiniteNumber,
+      convertLegacy: (value) => value / MINUTE_MS,
+      legacyInvalidReason: 'expected a finite number of milliseconds; using default',
+      fallback: defaults.decision.noSendAfterActivityMinutes,
+    },
+    warn,
+  );
+  const maxPerHour = fieldWithDeprecatedFallback(
+    {
+      section: decision,
+      key: 'maxPerHour',
+      label: 'decision.maxPerHour',
+      isValid: isFiniteNumber,
+      invalidReason: 'expected a finite number; using fallback',
+      root,
+      legacyKey: 'maxInitiationsPerHour',
+      legacyIsValid: isFiniteNumber,
+      convertLegacy: (value) => value,
+      legacyInvalidReason: 'expected a finite number; using default',
+      fallback: defaults.decision.maxPerHour,
+    },
+    warn,
+  );
 
   const sendThreshold = numberField(
     decision,

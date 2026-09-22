@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "KAIROS sidecar <-> hermes-plugin/kairos cross-process contract. Byte-identical mirror: src/hermes-bridge/contract.json.",
+  "description": "KAIROS sidecar <-> hermes-plugin/kairos cross-process contract. Byte-identical mirror: src/hermes-bridge/contract.json; identity is enforced by tests on both lanes.",
   "transport": {
     "contentType": "application/json",
     "contentTypeHeader": "content-type",
@@ -58,7 +58,16 @@
       "fieldTypes": {"type": "string", "sessionId": "string", "content": "string", "ts": "number"}
     }
   },
-  "pidfile": "sidecar.pid",
+  "pidfile": {
+    "filename": "sidecar.pid",
+    "writer": "sidecar",
+    "body": {
+      "format": "json",
+      "fields": {"pid": "positive-int", "nonce": "string"},
+      "canonicalExample": "{\"pid\":1234,\"nonce\":\"0aff42\"}",
+      "legacyTolerated": ["<pid>", "<pid> <nonce>"]
+    }
+  },
   "dataDir": {
     "setting": "dataDir",
     "envOverride": "HERMES_HOME",

@@ -8,18 +8,19 @@ import {
   type ProactiveChatConfig,
 } from './config.js';
 import { buildContextBundle } from './context.js';
-import { ONE_DAY_MS } from './decision.js';
 import { DelayedQueue } from './delayed-queue.js';
 import {
   applyUserMessageCoupling,
-  clamp01,
+  clampEmotionState,
   DEFAULT_EMOTION_DYNAMICS,
   DEFAULT_EMOTION_STATE,
   EmotionStore,
   evolveEmotion,
-  type EmotionDynamicsConfig,
+  isDefaultEmotion,
+  isEmotionState,
 } from './emotion.js';
 import { Heartbeat } from './heartbeat.js';
+import { SendLog } from './sends.js';
 import {
   PROACTIVE_CHAT_SNAPSHOT_VERSION,
   type EmotionState,
@@ -43,51 +44,6 @@ export const PROACTIVE_CHAT_STATE_NAME = 'proactive-chat';
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
-}
-
-/** A finite number inside the closed unit interval `[0, 1]`. */
-function isUnitInterval(value: unknown): value is number {
-  return isFiniteNumber(value) && value >= 0 && value <= 1;
-}
-
-function isEmotionState(value: unknown): value is EmotionState {
-  if (typeof value !== 'object' || value === null) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    isUnitInterval(record['valence']) &&
-    isUnitInterval(record['arousal']) &&
-    isUnitInterval(record['socialNeed'])
-  );
-}
-
-/** Clamp every emotion field into `[0, 1]` (defense in depth on restore). */
-function clampEmotionState(state: EmotionState): EmotionState {
-  return {
-    valence: clamp01(state.valence),
-    arousal: clamp01(state.arousal),
-    socialNeed: clamp01(state.socialNeed),
-  };
-}
-
-/** Whether a state is exactly the pristine default (i.e. carries no signal). */
-function isDefaultEmotion(state: EmotionState): boolean {
-  return (
-    state.valence === DEFAULT_EMOTION_STATE.valence &&
-    state.arousal === DEFAULT_EMOTION_STATE.arousal &&
-    state.socialNeed === DEFAULT_EMOTION_STATE.socialNeed
-  );
-}
-
-function isHeldStub(value: unknown): value is HeldStub {
-  if (typeof value !== 'object' || value === null) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record['sessionId'] === 'string' &&
-    isFiniteNumber(record['enqueuedAt']) &&
-    isFiniteNumber(record['scoreAtEnqueue']) &&
-    typeof record['breakdown'] === 'object' &&
-    record['breakdown'] !== null
-  );
 }
 
 /** Validate the outer snapshot envelope; inner entries are guarded per-field. */
@@ -144,7 +100,7 @@ export class ProactiveChatPlugin implements Plugin {
   #heartbeatTicks = 0;
   #heartbeatRunning = false;
   #stopped = false;
-  readonly #sends = new Map<string, number[]>();
+  readonly #sends = new SendLog();
   readonly #nowFn: () => number;
   readonly #onWarn: ConfigWarnHandler | undefined;
   readonly #deliveryHandler: ProactiveDeliveryHandler | undefined;
@@ -177,7 +133,7 @@ export class ProactiveChatPlugin implements Plugin {
 
   /** Observability hook: tracked proactive send timestamps for a session. */
   sendTimestamps(sessionId: string): readonly number[] {
-    return this.#sends.get(sessionId) ?? [];
+    return this.#sends.recent(sessionId, this.#nowFn());
   }
 
   /**
@@ -206,14 +162,9 @@ export class ProactiveChatPlugin implements Plugin {
       this.#onWarn ? { onWarn: this.#onWarn } : {},
     );
     this.#config = config;
-    const dynamics: EmotionDynamicsConfig = {
-      decayRatePerHour: config.emotion.decayRatePerHour,
-      socialNeedGrowthPerHour: config.emotion.socialNeedGrowthPerHour,
-      arousalFloor: config.emotion.arousalFloor,
-    };
     this.#emotionStore = new EmotionStore({
       now: this.#nowFn,
-      config: dynamics,
+      config: config.emotion,
       initialState: DEFAULT_EMOTION_STATE,
     });
     this.#queue = new DelayedQueue({
@@ -233,12 +184,8 @@ export class ProactiveChatPlugin implements Plugin {
       emotion: emotionStore,
       queue,
       sends: {
-        recent: (sessionId, atMs) => this.#recentSends(sessionId, atMs),
-        record: (sessionId, atMs) => {
-          const sends = this.#recentSends(sessionId, atMs);
-          sends.push(atMs);
-          this.#sends.set(sessionId, sends);
-        },
+        recent: (sessionId, atMs) => this.#sends.recent(sessionId, atMs),
+        record: (sessionId, atMs) => this.#sends.record(sessionId, atMs),
       },
       llm: ctx.llm,
       bundle: (sessionId, emotion, atMs) =>
@@ -254,7 +201,7 @@ export class ProactiveChatPlugin implements Plugin {
       isStopped: () => this.#stopped,
     });
 
-    if (config.persistence.enabled) this.#restore(dynamics);
+    if (config.persistence.enabled) this.#restore();
 
     // User messages signal presence: excitement rises while the urge to reach
     // out drops. Agent-originated messages deliberately do not couple.
@@ -344,11 +291,12 @@ export class ProactiveChatPlugin implements Plugin {
    * Restore persisted state, pruning to current rules and evolving emotions
    * forward by the wall-clock gap since the snapshot was taken.
    */
-  #restore(dynamics: EmotionDynamicsConfig): void {
+  #restore(): void {
     const storage = this.#storage;
     const store = this.#emotionStore;
     const queue = this.#queue;
-    if (!storage || !store || !queue) return;
+    const config = this.#config;
+    if (!storage || !store || !queue || !config) return;
 
     let result: JsonStoreReadResult | undefined;
     try {
@@ -378,20 +326,13 @@ export class ProactiveChatPlugin implements Plugin {
       const emotion = isEmotionState(savedEmotion)
         ? clampEmotionState(savedEmotion)
         : DEFAULT_EMOTION_STATE;
-      store.set(sessionId, evolveEmotion(emotion, elapsed, dynamics));
+      store.set(sessionId, evolveEmotion(emotion, elapsed, config.emotion));
 
       const savedSends = entry['sends'];
-      if (Array.isArray(savedSends)) {
-        const sends = savedSends.filter(
-          (at): at is number => isFiniteNumber(at) && now - at < ONE_DAY_MS,
-        );
-        if (sends.length > 0) this.#sends.set(sessionId, sends);
-      }
+      if (Array.isArray(savedSends)) this.#sends.restore(sessionId, savedSends, now);
 
       const savedQueue = entry['queue'];
-      if (Array.isArray(savedQueue)) {
-        queue.restore(sessionId, savedQueue.filter(isHeldStub));
-      }
+      if (Array.isArray(savedQueue)) queue.restore(sessionId, savedQueue);
     }
   }
 
@@ -416,7 +357,7 @@ export class ProactiveChatPlugin implements Plugin {
       const sessions: Record<string, ProactivePersistedSession> = {};
       const ids = new Set<string>([
         ...store.sessions(),
-        ...this.#sends.keys(),
+        ...this.#sends.sessionIds(),
         ...queue.sessions(),
       ]);
       for (const sessionId of ids) {
@@ -424,7 +365,7 @@ export class ProactiveChatPlugin implements Plugin {
         // `get` (not `peek`) evolves the stored state to `now` so the snapshot
         // and its `savedAt` stamp stay consistent for restore.
         const emotion = store.get(sessionId, now);
-        const sends = (this.#sends.get(sessionId) ?? []).filter((at) => now - at < ONE_DAY_MS);
+        const sends = this.#sends.recent(sessionId, now);
         const held = [...queue.entries(sessionId)];
         // Drop entries that carry no signal: a pristine-default emotion with no
         // sends and no held stubs is indistinguishable from a fresh session.
@@ -441,14 +382,6 @@ export class ProactiveChatPlugin implements Plugin {
     } catch (error) {
       console.warn('[plugin] failed to persist proactive-chat state:', error);
     }
-  }
-
-  /** Send timestamps for a session within the counting window, pruned in place. */
-  #recentSends(sessionId: string, now: number): number[] {
-    const existing = this.#sends.get(sessionId) ?? [];
-    const recent = existing.filter((at) => now - at < ONE_DAY_MS);
-    this.#sends.set(sessionId, recent);
-    return recent;
   }
 }
 

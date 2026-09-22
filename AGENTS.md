@@ -18,9 +18,11 @@
 ## Architecture (what filenames don't tell you)
 
 - All behavior lives in plugins (`src/builtins/`); the kernel only provides services. A plugin receives `PluginContext` = `{eventBus, sessions, scheduler, llm, storage, config, send}`
-- `ctx.send(sessionId, content)` is the only sanctioned way to speak: it appends the agent message AND emits `message:outbound`. Never append agent messages directly
+- `ctx.send(sessionId, content)` is the only sanctioned way for a plugin to speak: it appends the agent message AND emits `message:outbound`. Hosts (the bridge) speak through `runtime.send` — the same module behind `ctx.send`. Never call `sessions.appendMessage` with role `'agent'` directly
 - `SessionManager` emits `message:appended` for every appended role (when the runtime injected its bus); `PluginRegistry` is failure-isolated — a throwing `init()` is logged and skipped, later plugins still initialize; teardown runs in reverse order
 - Scheduler tasks are `setInterval`-based, skip a tick while the previous run of the same task is in flight, and timers are `unref()`'d (don't keep the event loop alive)
+- The bridge entry's lifecycle (delivery-mode mapping, config surgery, bind + stale-pid recovery, pidfile write, signal shutdown) lives behind `bootBridge` in `src/hermes-bridge/main.ts`; `main()` only maps boot failures onto the exit code. The proactive delivery transport is injected (`createDeliveryHandler`), never hardcoded
+- The Bridge ↔ hermes-agent contract is `src/hermes-bridge/contract.json`, byte-identical to `hermes-plugin/kairos/tests/contract.json` (identity enforced by tests on both lanes — edit both together). The pidfile body is canonical JSON `{pid, nonce}`; both lanes' recovery readers also tolerate bare `<pid>` / `<pid> <nonce>`
 
 ## proactive-chat plugin (src/builtins/proactive-chat/ — full reference in its README.md)
 
@@ -29,6 +31,8 @@
 - HOLD band queues contentless stubs; the LLM generates content only on promotion. Never generate at enqueue time
 - Emotion defaults are calibrated: long-run score ceiling 0.666 vs `sendThreshold` 0.6, pinned by a 48h default-threshold e2e test. Changing `DEFAULT_EMOTION_STATE`, the dynamics constants (single production copy: `emotion.ts`), or the intensity formula can silently kill the feature — keep that test green
 - Plugin state persists to `<storage.dataDir>/proactive-chat.json` (default `.hermes-data/`, git-ignored): snapshots prune to live sessions, corrupt files → warn + fresh start, `persistence.enabled: false` opts out. Kernel sessions/messages are in-memory only
+- The one-day send window is owned by `SendLog` (`sends.ts`): every read prunes in place, so guardrail counts, the snapshot, and `sendTimestamps()` never re-filter raw stamps
+- `DelayedQueue.rescore` takes the session's single current decision score — a held stub belongs to a session, so a tick scores all of a session's stubs alike
 - Re-init must be idempotent: clear stale counters and unsubscribe before re-subscribing
 
 ## Config

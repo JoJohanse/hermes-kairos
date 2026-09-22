@@ -28,7 +28,6 @@ import {
   type HermesConfig,
 } from '../config/config.js';
 import { HermesRuntime } from '../core/runtime.js';
-import type { MessageRole } from '../core/types.js';
 import { ProactiveChatPlugin } from '../builtins/proactive-chat/index.js';
 import type {
   ProactiveDelegateEvent,
@@ -36,12 +35,14 @@ import type {
   ProactiveDeliveryPayload,
   ProactiveThoughtEvent,
 } from '../builtins/proactive-chat/types.js';
+import type { LLMProvider } from '../llm/types.js';
 import { OpenAICompatibleProvider } from '../llm/openai-compatible.js';
 import {
   listenWithStalePidRecovery,
   nodePidFileFs,
   removePidFile,
   writePidFile,
+  type PidFileFs,
 } from './pidfile.js';
 
 /** Minimal trigger surface the bridge needs from the proactive-chat plugin. */
@@ -311,13 +312,16 @@ interface ResolvedBridgeDeps {
   nonce: string | undefined;
 }
 
-/** Outbound callback transport dependencies. */
-interface CallbackSenderDeps {
+/** Delivery transport dependencies (callback URL + injected transport). */
+export interface DeliveryTransportDeps {
   callbackUrl: string;
   token: string;
   fetchImpl: BridgeFetch;
   logger: BridgeLogger;
 }
+
+/** Outbound callback transport dependencies. */
+type CallbackSenderDeps = DeliveryTransportDeps;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -346,7 +350,7 @@ function parseJson(body: string): unknown {
 }
 
 /** `POST /events`: feed one message into the kernel session store. */
-function handleEvents(deps: ResolvedBridgeDeps, body: string): BridgeResponse {
+async function handleEvents(deps: ResolvedBridgeDeps, body: string): Promise<BridgeResponse> {
   const parsed = parseJson(body);
   if (!isPlainRecord(parsed)) {
     return { status: 400, body: { error: 'body must be a JSON object' } };
@@ -365,10 +369,15 @@ function handleEvents(deps: ResolvedBridgeDeps, body: string): BridgeResponse {
     return { status: 400, body: { error: 'content must be a string' } };
   }
 
-  const role: MessageRole = type === 'user-message' ? 'user' : 'agent';
   deps.runtime.sessions.getOrCreate(sessionId);
-  // Flows through `message:appended`, so emotion coupling happens automatically.
-  deps.runtime.sessions.appendMessage(sessionId, role, content);
+  if (type === 'agent-message') {
+    // Speak through the runtime's single speak path so `message:outbound` fires
+    // exactly as it would for a plugin speaking via `ctx.send`.
+    await deps.runtime.send(sessionId, content);
+    return { status: 202, body: { ok: true } };
+  }
+  // User messages only need `message:appended` for emotion coupling.
+  deps.runtime.sessions.appendMessage(sessionId, 'user', content);
   return { status: 202, body: { ok: true } };
 }
 
@@ -655,30 +664,107 @@ export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
 }
 
 /**
- * Bridge entry point. Applies argv over `hermes.config.json`, requires
- * `hermesBridge.enabled`, starts the runtime, binds the HTTP server (recovering
- * once from a live stale sidecar), writes the pidfile, then waits for a signal.
+ * Awaiting delivery transport: the plugin only records a send slot after the
+ * callback POST succeeds, so the Python lane can retry failed outreach. The
+ * transport is injected, so tests and other hosts can supply their own.
  */
-export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
-  const onWarn = defaultConfigWarn;
-  const config = loadConfig({ onWarn });
-  const args = parseBridgeArgs(argv);
-  const { bridge, dataDir, nonce } = resolveBridgeArgs(config, args);
+export function createDeliveryHandler(deps: DeliveryTransportDeps): ProactiveDeliveryHandler {
+  return async (payload) => {
+    const callback = toCallbackPayload(payload);
+    if (!callback) {
+      throw new Error(`unsupported delivery payload for kind ${payload.kind}`);
+    }
+    await sendCallback(deps, callback);
+  };
+}
 
-  if (!bridge.enabled) {
-    console.error(
-      '[hermes-bridge] disabled: set hermesBridge.enabled = true in hermes.config.json to run the bridge entry',
-    );
-    process.exit(1);
+/** Thrown by {@link bootBridge} when `hermesBridge.enabled` is false. */
+export class BridgeDisabledError extends Error {
+  constructor() {
+    super('hermes-bridge is disabled');
+    this.name = 'BridgeDisabledError';
   }
+}
+
+/** Process side effects the boot lifecycle needs; injectable for tests. */
+export interface BridgeBootProcess {
+  readonly pid: number;
+  onSignal(signal: string, handler: () => void): void;
+  setExitCode(code: number): void;
+}
+
+const nodeBootProcess: BridgeBootProcess = {
+  pid: process.pid,
+  onSignal: (signal, handler) => {
+    process.on(signal as NodeJS.Signals, handler);
+  },
+  setExitCode: (code) => {
+    process.exitCode = code;
+  },
+};
+
+/** Options for {@link bootBridge} — every default is the production adapter. */
+export interface BridgeBootOptions {
+  /** Raw argv after the script name. Defaults to `[]`. */
+  argv?: readonly string[];
+  /** Config override (tests). Defaults to `loadConfig({ onWarn: defaultConfigWarn })`. */
+  config?: HermesConfig;
+  /** Outbound transport for proactive delivery callbacks. */
+  fetchImpl?: BridgeFetch;
+  /** Diagnostics sink for boot and shutdown messages. */
+  logger?: BridgeLogger;
+  /** Pidfile filesystem. Defaults to the real `node:fs`. */
+  pidFs?: PidFileFs;
+  /** LLM provider override (tests). Defaults to `OpenAICompatibleProvider` from config. */
+  llm?: LLMProvider;
+  /** Signals that trigger graceful shutdown. Defaults to {@link BRIDGE_SHUTDOWN_SIGNALS}. */
+  signals?: readonly string[];
+  /** Process adapter. Defaults to the real `process`. */
+  process?: BridgeBootProcess;
+}
+
+/** Handle over a booted bridge. */
+export interface BridgeBootHandle {
+  /** The booted runtime (event bus, sessions), for host observability. */
+  readonly runtime: HermesRuntime;
+  /** The registered proactive-chat plugin. */
+  readonly plugin: ProactiveChatPlugin;
+  /** Delivery mode the plugin was configured with. */
+  readonly deliveryMode: 'self' | 'delegate';
+  /** Idempotent graceful shutdown: server → runtime → pidfile removal. */
+  stop(signal?: string): Promise<void>;
+}
+
+/**
+ * The Bridge boot module. Applies argv over `hermes.config.json`, requires
+ * `hermesBridge.enabled` (throws {@link BridgeDisabledError}), maps the argv
+ * delivery mode onto the plugin's delivery mode, starts the runtime, binds the
+ * HTTP server (recovering once from a live stale sidecar), writes the pidfile,
+ * registers the shutdown signals and returns a handle. A bind failure stops the
+ * runtime before rejecting, so the caller only maps the error onto the exit code.
+ */
+export async function bootBridge(options: BridgeBootOptions = {}): Promise<BridgeBootHandle> {
+  const proc = options.process ?? nodeBootProcess;
+  const logger = options.logger ?? consoleBridgeLogger;
+  const pidFs = options.pidFs ?? nodePidFileFs;
+  const onWarn = defaultConfigWarn;
+  const config = options.config ?? loadConfig({ onWarn });
+  const { bridge, dataDir, nonce } = resolveBridgeArgs(
+    config,
+    parseBridgeArgs(options.argv ?? []),
+  );
+
+  if (!bridge.enabled) throw new BridgeDisabledError();
 
   const deliveryMode = bridge.deliveryMode === 'turn' ? 'delegate' : 'self';
-  const llm = new OpenAICompatibleProvider({
-    baseURL: config.llm.baseURL,
-    apiKey: config.llm.apiKey,
-    model: config.llm.model,
-    requestTimeoutMs: config.llm.requestTimeoutMs,
-  });
+  const llm =
+    options.llm ??
+    new OpenAICompatibleProvider({
+      baseURL: config.llm.baseURL,
+      apiKey: config.llm.apiKey,
+      model: config.llm.model,
+      requestTimeoutMs: config.llm.requestTimeoutMs,
+    });
 
   const runtime = new HermesRuntime({
     config: {
@@ -696,25 +782,15 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     llm,
   });
 
-  // Awaited delivery transport: the plugin only records a send slot after the
-  // callback POST succeeds, so the Python lane can retry failed outreach.
-  const deliveryHandler: ProactiveDeliveryHandler = async (payload) => {
-    const callback = toCallbackPayload(payload);
-    if (!callback) {
-      throw new Error(`unsupported delivery payload for kind ${payload.kind}`);
-    }
-    await sendCallback(
-      {
-        callbackUrl: bridge.callbackUrl,
-        token: bridge.token,
-        fetchImpl: defaultBridgeFetch,
-        logger: consoleBridgeLogger,
-      },
-      callback,
-    );
-  };
-
-  const plugin = new ProactiveChatPlugin({ onWarn, deliveryHandler });
+  const plugin = new ProactiveChatPlugin({
+    onWarn,
+    deliveryHandler: createDeliveryHandler({
+      callbackUrl: bridge.callbackUrl,
+      token: bridge.token,
+      fetchImpl: options.fetchImpl ?? defaultBridgeFetch,
+      logger,
+    }),
+  });
   runtime.register(plugin);
 
   await runtime.start();
@@ -728,54 +804,77 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   });
 
   try {
-    await listenWithStalePidRecovery(server, { dataDir, logger: consoleBridgeLogger });
+    await listenWithStalePidRecovery(server, { dataDir, fs: pidFs, logger });
   } catch (error) {
-    console.error('[hermes-bridge] failed to bind:', error);
+    logger.error(`[hermes-bridge] failed to bind: ${String(error)}`);
     try {
       await runtime.stop();
     } catch (stopError) {
-      console.error('[hermes-bridge] shutdown error:', stopError);
+      logger.error(`[hermes-bridge] shutdown error: ${String(stopError)}`);
     }
-    process.exit(1);
+    throw error;
   }
 
   try {
-    writePidFile(nodePidFileFs, dataDir, { pid: process.pid, nonce });
+    writePidFile(pidFs, dataDir, { pid: proc.pid, nonce });
   } catch (error) {
-    console.error('[hermes-bridge] failed to write pidfile:', error);
+    logger.error(`[hermes-bridge] failed to write pidfile: ${String(error)}`);
   }
-  console.log(
+  logger.info(
     `[hermes-bridge] listening on http://${bridge.host}:${bridge.port} (delivery=${deliveryMode}, nonce=${nonce})`,
   );
 
-  let shuttingDown = false;
-  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`[hermes-bridge] received ${signal}, shutting down…`);
-    try {
-      await server.close();
-    } catch (error) {
-      console.error('[hermes-bridge] error closing server:', error);
-      process.exitCode = 1;
-    }
-    try {
-      await runtime.stop();
-    } catch (error) {
-      console.error('[hermes-bridge] shutdown error:', error);
-      process.exitCode = 1;
-    }
-    removePidFile(nodePidFileFs, dataDir);
+  let shutdown: Promise<void> | undefined;
+  const stop = (signal?: string): Promise<void> => {
+    if (shutdown) return shutdown;
+    shutdown = (async (): Promise<void> => {
+      if (signal !== undefined) logger.info(`[hermes-bridge] received ${signal}, shutting down…`);
+      try {
+        await server.close();
+      } catch (error) {
+        logger.error(`[hermes-bridge] error closing server: ${String(error)}`);
+        proc.setExitCode(1);
+      }
+      try {
+        await runtime.stop();
+      } catch (error) {
+        logger.error(`[hermes-bridge] shutdown error: ${String(error)}`);
+        proc.setExitCode(1);
+      }
+      removePidFile(pidFs, dataDir);
+    })();
+    return shutdown;
   };
 
-  for (const signal of BRIDGE_SHUTDOWN_SIGNALS) {
+  for (const signal of options.signals ?? BRIDGE_SHUTDOWN_SIGNALS) {
     try {
-      process.on(signal, () => {
-        void shutdown(signal);
+      proc.onSignal(signal, () => {
+        void stop(signal);
       });
     } catch {
       // A platform that does not support this signal (e.g. SIGBREAK off Windows).
     }
+  }
+
+  return { runtime, plugin, deliveryMode, stop };
+}
+
+/**
+ * Bridge entry point: boot the bridge and map boot failures onto the process
+ * exit code. Every lifecycle invariant lives in {@link bootBridge}.
+ */
+export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
+  try {
+    await bootBridge({ argv });
+  } catch (error) {
+    if (error instanceof BridgeDisabledError) {
+      console.error(
+        '[hermes-bridge] disabled: set hermesBridge.enabled = true in hermes.config.json to run the bridge entry',
+      );
+    } else {
+      console.error('[hermes-bridge] failed to start:', error);
+    }
+    process.exit(1);
   }
 }
 

@@ -162,6 +162,40 @@ describe('loadConfig', () => {
     expect(warnings.map((warning) => warning.field)).toEqual(['llm.requestTimeoutMs']);
   });
 
+  it('warns on malformed llm fields and falls back to defaults', () => {
+    const path = tempConfigPath(
+      JSON.stringify({ llm: { baseURL: 42, model: '', apiKey: 7 } }),
+    );
+    const { warnings, onWarn } = collector();
+    const config = loadConfig({ configPath: path, env: {}, onWarn });
+
+    expect(config.llm.baseURL).toBe('https://api.openai.com/v1');
+    expect(config.llm.model).toBe('gpt-4o-mini');
+    expect(config.llm.apiKey).toBe('');
+    expect(warnings.map((warning) => warning.field)).toEqual([
+      'llm.baseURL',
+      'llm.apiKey',
+      'llm.model',
+    ]);
+  });
+
+  it('accepts a fully valid llm section with zero warnings', () => {
+    const path = tempConfigPath(
+      JSON.stringify({
+        llm: { baseURL: 'http://localhost:1234/v1', apiKey: 'secret', model: 'test-model' },
+      }),
+    );
+    const { warnings, onWarn } = collector();
+    const config = loadConfig({ configPath: path, env: {}, onWarn });
+
+    expect(config.llm).toMatchObject({
+      baseURL: 'http://localhost:1234/v1',
+      apiKey: 'secret',
+      model: 'test-model',
+    });
+    expect(warnings).toEqual([]);
+  });
+
   it('passes partial plugin slices through raw; the plugin resolves them over the defaults', () => {
     const path = tempConfigPath(
       JSON.stringify({

@@ -31,7 +31,8 @@ export const defaultConfigWarn: ConfigWarnHandler = (warning) => {
   console.warn(`[config] ${warning.field}: ${warning.reason} (received ${rendered})`);
 };
 
-function warnIf(
+/** Emit `warning` through `warn` when `condition` holds. */
+export function warnIf(
   warn: ConfigWarnHandler,
   field: string,
   value: unknown,
@@ -41,7 +42,7 @@ function warnIf(
   if (condition) warn({ field, value, reason });
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
@@ -82,7 +83,7 @@ export function booleanFrom(
 
 const CLOCK_PATTERN = /^([01]?\d|2[0-3]):[0-5]\d$/;
 
-function isFiniteNumber(value: unknown): value is number {
+export function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
@@ -98,6 +99,21 @@ export function numberField(
   if (value === undefined) return fallback;
   if (isFiniteNumber(value)) return value;
   warn({ field, value, reason: 'expected a finite number; using default' });
+  return fallback;
+}
+
+/** Read a non-empty string, warning when a present value must be defaulted. */
+export function stringField(
+  source: Record<string, unknown>,
+  key: string,
+  fallback: string,
+  warn: ConfigWarnHandler,
+  field: string,
+): string {
+  const value = source[key];
+  if (value === undefined) return fallback;
+  if (typeof value === 'string' && value.trim() !== '') return value;
+  warn({ field, value, reason: 'expected a non-empty string; using default' });
   return fallback;
 }
 

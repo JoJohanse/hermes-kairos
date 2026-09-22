@@ -19,7 +19,7 @@ export interface KernelEvents extends EventMap {
   'runtime:stopped': Record<string, never>;
   /** Emitted for every appended message (any role) once it has been stored. */
   'message:appended': { message: Message };
-  /** Emitted by `PluginContext.send` for every outbound agent message. */
+  /** Emitted by the speak path (`runtime.send`, exposed to plugins as `PluginContext.send`) for every outbound agent message. */
   'message:outbound': { sessionId: string; content: string; timestamp: number };
   /** Emitted when plugin initialization fails. */
   'plugin:error': { plugin: string; error: unknown };
@@ -91,6 +91,22 @@ export class HermesRuntime {
   }
 
   /**
+   * The speak path: append an agent message and emit `message:outbound` for it.
+   * The one sanctioned way to speak as the agent — plugins receive it as
+   * `PluginContext.send`, hosts (the bridge) call it directly, so the
+   * append-then-outbound sequence has exactly one owner.
+   */
+  async send(sessionId: string, content: string): Promise<Message> {
+    const message = this.sessions.appendMessage(sessionId, 'agent', content);
+    this.eventBus.emit('message:outbound', {
+      sessionId,
+      content,
+      timestamp: message.timestamp,
+    });
+    return message;
+  }
+
+  /**
    * Start the scheduler and initialize all registered plugins in order.
    * Plugin init failures are collected and logged, never fatal.
    */
@@ -107,15 +123,7 @@ export class HermesRuntime {
       llm: this.llm,
       storage: this.storage,
       config: this.config.plugins,
-      send: async (sessionId, content) => {
-        const message = this.sessions.appendMessage(sessionId, 'agent', content);
-        this.eventBus.emit('message:outbound', {
-          sessionId,
-          content,
-          timestamp: message.timestamp,
-        });
-        return message;
-      },
+      send: (sessionId, content) => this.send(sessionId, content),
     });
     this.eventBus.emit('runtime:started', {});
   }

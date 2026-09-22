@@ -32,6 +32,23 @@ export interface RescoreResult {
 
 const HOUR_MS = 3_600_000;
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** Whether a value is a well-formed {@link HeldStub} (e.g. restored from a snapshot). */
+export function isHeldStub(value: unknown): value is HeldStub {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record['sessionId'] === 'string' &&
+    isFiniteNumber(record['enqueuedAt']) &&
+    isFiniteNumber(record['scoreAtEnqueue']) &&
+    typeof record['breakdown'] === 'object' &&
+    record['breakdown'] !== null
+  );
+}
+
 /** Per-session queue of held {@link HeldStub}s. */
 export class DelayedQueue {
   readonly #queues = new Map<string, HeldStub[]>();
@@ -92,12 +109,15 @@ export class DelayedQueue {
 
   /**
    * Replace a session's queue with restored stubs, pruned to current rules:
-   * stubs older than `maxAgeHours` are dropped and the queue is capped at
-   * `maxSize`, keeping the highest-scoring stubs (matching eviction order).
+   * malformed stubs are dropped, stubs older than `maxAgeHours` are dropped,
+   * and the queue is capped at `maxSize`, keeping the highest-scoring stubs
+   * (matching eviction order).
    */
-  restore(sessionId: string, stubs: readonly HeldStub[]): void {
+  restore(sessionId: string, stubs: readonly unknown[]): void {
     const now = this.#now();
-    const fresh = stubs.filter((stub) => now - stub.enqueuedAt <= this.#maxAgeMs);
+    const fresh = stubs
+      .filter(isHeldStub)
+      .filter((stub) => now - stub.enqueuedAt <= this.#maxAgeMs);
     const trimmed = [...fresh]
       .sort((a, b) => b.scoreAtEnqueue - a.scoreAtEnqueue)
       .slice(0, this.#maxSize);
@@ -105,16 +125,14 @@ export class DelayedQueue {
   }
 
   /**
-   * Re-score every held stub for a session.
+   * Re-score every held stub for a session against the session's one current
+   * decision score — a stub belongs to a session, so a tick scores them all
+   * alike.
    *
-   * @param scoreOf Current score for a stub.
+   * @param score The session's current decision score.
    * @param sendThreshold Score at or above which a stub is promoted.
    */
-  rescore(
-    sessionId: string,
-    scoreOf: (stub: HeldStub) => number,
-    sendThreshold: number,
-  ): RescoreResult {
+  rescore(sessionId: string, score: number, sendThreshold: number): RescoreResult {
     const now = this.#now();
     const held = this.#queues.get(sessionId) ?? [];
     const promoted: HeldStub[] = [];
@@ -126,7 +144,6 @@ export class DelayedQueue {
         expired.push(stub);
         continue;
       }
-      const score = scoreOf(stub);
       const rescored: HeldStub = { ...stub, scoreAtEnqueue: score };
       if (score >= sendThreshold) promoted.push(rescored);
       else queued.push(rescored);

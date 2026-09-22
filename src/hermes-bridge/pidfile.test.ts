@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   listenWithStalePidRecovery,
@@ -80,6 +81,50 @@ describe('sidecar pidfile', () => {
     const fs = new MemoryPidFs();
     expect(readPidFile(fs, 'data')).toBeUndefined();
     expect(() => removePidFile(fs, 'data')).not.toThrow();
+  });
+});
+
+describe('pidfile body contract (contract.json pidfile.body)', () => {
+  interface PidfileContract {
+    filename: string;
+    writer: string;
+    body: { format: string; canonicalExample: string; legacyTolerated: string[] };
+  }
+  const contractPath = new URL('./contract.json', import.meta.url);
+  const contract = JSON.parse(readFileSync(contractPath, 'utf8')) as {
+    pidfile: PidfileContract;
+  };
+
+  it('pins the filename and the writer lane', () => {
+    expect(contract.pidfile.filename).toBe('sidecar.pid');
+    expect(pidFilePath('data').endsWith(contract.pidfile.filename)).toBe(true);
+    expect(contract.pidfile.writer).toBe('sidecar');
+  });
+
+  it('writes exactly the canonical body shape the contract names', () => {
+    const fs = new MemoryPidFs();
+    writePidFile(fs, 'data', { pid: 4242, nonce: 'nonce-1' });
+    const written = fs.files.get(pidFilePath('data')) as string;
+
+    const canonical = contract.pidfile.body.canonicalExample;
+    expect(contract.pidfile.body.format).toBe('json');
+    expect(Object.keys(JSON.parse(written)).sort()).toEqual(
+      Object.keys(JSON.parse(canonical)).sort(),
+    );
+    expect(parsePidFile(canonical)).toEqual({ pid: 1234, nonce: '0aff42' });
+    expect(parsePidFile(written)).toEqual({ pid: 4242, nonce: 'nonce-1' });
+  });
+
+  it('still recovers from every legacy body the contract tolerates', () => {
+    for (const legacy of contract.pidfile.body.legacyTolerated) {
+      const body = legacy.replace('<pid>', '1234').replace('<nonce>', 'abc');
+      expect(parsePidFile(body)).toMatchObject({ pid: 1234 });
+    }
+  });
+
+  it('is byte-identical to the python-side mirror', () => {
+    const mirrorPath = new URL('../../hermes-plugin/kairos/tests/contract.json', import.meta.url);
+    expect(readFileSync(mirrorPath).equals(readFileSync(contractPath))).toBe(true);
   });
 });
 

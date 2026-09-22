@@ -455,7 +455,7 @@ interface ContractShape {
   sidecarArgv: { allOptional: boolean; flags: string[] };
   speakPayloads: { inject: ContractPayload; send: ContractPayload };
   eventPayloads: Record<string, ContractPayload>;
-  pidfile: string;
+  pidfile: { filename: string };
 }
 
 function loadContract(): ContractShape {
@@ -541,6 +541,31 @@ describe('sidecar HTTP hardening + contract (F3/F8/F10)', () => {
     ]);
   });
 
+  it('agent-message speaks through the runtime speak path: message:outbound fires', async () => {
+    const { base, runtime } = await start();
+    const outbound: Array<{ sessionId: string; content: string }> = [];
+    runtime.eventBus.on('message:outbound', (payload) => outbound.push(payload));
+
+    const user = await fetch(`${base}/events`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'user-message', sessionId: 'speak', content: 'hi' }),
+    });
+    const agent = await fetch(`${base}/events`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'agent-message', sessionId: 'speak', content: 'hello again' }),
+    });
+    expect(user.status).toBe(202);
+    expect(agent.status).toBe(202);
+
+    // Only the agent side of the conversation is an outbound agent message;
+    // user messages stay append-only.
+    expect(outbound).toEqual([
+      { sessionId: 'speak', content: 'hello again', timestamp: expect.any(Number) },
+    ]);
+  });
+
   it('survives an aborted connection and keeps serving the next request', async () => {
     const { base } = await start();
     const url = new URL(base);
@@ -583,7 +608,7 @@ describe('sidecar HTTP hardening + contract (F3/F8/F10)', () => {
     expect([...contract.sidecarArgv.flags].sort()).toEqual(
       ['--port', '--host', '--token', '--callback-url', '--delivery-mode', '--data-dir', '--nonce'].sort(),
     );
-    expect(contract.pidfile).toBe('sidecar.pid');
+    expect(contract.pidfile.filename).toBe('sidecar.pid');
 
     const { base } = await start({ config: { token: 'tok' } });
     // `exemptRoutes` are reachable without a token; the events route is not.

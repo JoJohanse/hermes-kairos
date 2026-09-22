@@ -68,11 +68,7 @@ export interface HeartbeatDeps {
   };
   /** HOLD-band queue. Real `DelayedQueue` satisfies this structurally. */
   queue: {
-    rescore(
-      sessionId: string,
-      scoreOf: (stub: HeldStub) => number,
-      sendThreshold: number,
-    ): RescoreResult;
+    rescore(sessionId: string, score: number, sendThreshold: number): RescoreResult;
     enqueue(stub: HeldStub): boolean;
     size(sessionId: string): number;
   };
@@ -169,11 +165,7 @@ export class Heartbeat {
 
     // 3. Promote held stubs whose fresh score reached the send threshold. This
     //    is the only place HOLD-band work spends an LLM call.
-    const rescored = queue.rescore(
-      session.id,
-      () => decision.score,
-      config.decision.sendThreshold,
-    );
+    const rescored = queue.rescore(session.id, decision.score, config.decision.sendThreshold);
     if (rescored.promoted.length > 0) {
       // Never deliver more than one proactive message per tick: extras go back.
       const reenqueueExtras = (): void => {

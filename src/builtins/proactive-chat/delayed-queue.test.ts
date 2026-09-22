@@ -42,7 +42,7 @@ describe('DelayedQueue', () => {
     queue.enqueue(stub('s1', 0.2, 0));
 
     now = 60_000;
-    const result = queue.rescore('s1', () => 0.9, 0.6);
+    const result = queue.rescore('s1', 0.9, 0.6);
 
     expect(result.promoted).toHaveLength(2);
     expect(result.promoted.every((entry) => entry.scoreAtEnqueue === 0.9)).toBe(true);
@@ -56,7 +56,7 @@ describe('DelayedQueue', () => {
     queue.enqueue(stub('s1', 0.1, 0));
 
     now = 60_000;
-    const result = queue.rescore('s1', () => 0.5, 0.6);
+    const result = queue.rescore('s1', 0.5, 0.6);
 
     expect(result.promoted).toHaveLength(0);
     expect(result.queued).toHaveLength(1);
@@ -69,7 +69,7 @@ describe('DelayedQueue', () => {
     queue.enqueue(stub('s1', 0.1, 0));
 
     now = 4 * HOUR + 1;
-    const result = queue.rescore('s1', () => 0.9, 0.6);
+    const result = queue.rescore('s1', 0.9, 0.6);
 
     expect(result.expired).toHaveLength(1);
     expect(result.promoted).toHaveLength(0);

@@ -5,8 +5,12 @@ import {
   booleanFrom,
   deepMerge,
   defaultConfigWarn,
+  isFiniteNumber,
+  isPlainObject,
   numberField,
   stringAllowEmptyFrom,
+  stringField,
+  warnIf,
   type ConfigWarnHandler,
 } from './fields.js';
 
@@ -92,31 +96,15 @@ export interface LoadConfigOptions {
   onWarn?: ConfigWarnHandler;
 }
 
-function warnIf(
-  warn: ConfigWarnHandler,
-  field: string,
-  value: unknown,
-  condition: boolean,
-  reason: string,
-): void {
-  if (condition) warn({ field, value, reason });
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
-
-function timeoutFromEnv(raw: string | undefined, warn: ConfigWarnHandler): number {
-  if (raw === undefined) return DEFAULT_LLM_REQUEST_TIMEOUT_MS;
-  const parsed = Number(raw);
-  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+function timeoutFromValue(value: unknown, warn: ConfigWarnHandler): number {
+  if (value === undefined) return DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+  // The env var is a string; the config file holds a JSON number. One reader
+  // owns the field so env and file cannot drift apart.
+  const parsed = typeof value === 'string' ? Number(value) : value;
+  if (isFiniteNumber(parsed) && parsed > 0) return parsed;
   warn({
     field: 'llm.requestTimeoutMs',
-    value: raw,
+    value,
     reason: 'must be a positive number; using default',
   });
   return DEFAULT_LLM_REQUEST_TIMEOUT_MS;
@@ -213,7 +201,7 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
       baseURL: env.LLM_BASE_URL ?? 'https://api.openai.com/v1',
       apiKey: env.LLM_API_KEY ?? '',
       model: env.LLM_MODEL ?? 'gpt-4o-mini',
-      requestTimeoutMs: timeoutFromEnv(env.LLM_REQUEST_TIMEOUT_MS, warn),
+      requestTimeoutMs: timeoutFromValue(env.LLM_REQUEST_TIMEOUT_MS, warn),
     },
     storage: { dataDir: DEFAULT_STORAGE_DATA_DIR },
     hermesBridge: { ...DEFAULT_HERMES_BRIDGE },
@@ -280,24 +268,13 @@ export function loadConfig(options: LoadConfigOptions = {}): HermesConfig {
     }
   }
   // Guarantee the timeout is always a positive number, whatever the file said.
-  const rawTimeout = mergedLlm['requestTimeoutMs'];
-  let requestTimeoutMs = defaults.llm.requestTimeoutMs;
-  if (rawTimeout !== undefined) {
-    if (isFiniteNumber(rawTimeout) && rawTimeout > 0) {
-      requestTimeoutMs = rawTimeout;
-    } else {
-      warn({
-        field: 'llm.requestTimeoutMs',
-        value: rawTimeout,
-        reason: 'must be a positive number; using default',
-      });
-    }
-  }
+  const requestTimeoutMs = timeoutFromValue(mergedLlm['requestTimeoutMs'], warn);
 
   return {
     llm: {
-      ...defaults.llm,
-      ...mergedLlm,
+      baseURL: stringField(mergedLlm, 'baseURL', defaults.llm.baseURL, warn, 'llm.baseURL'),
+      apiKey: stringAllowEmptyFrom(mergedLlm, 'apiKey', defaults.llm.apiKey, warn, 'llm.apiKey'),
+      model: stringField(mergedLlm, 'model', defaults.llm.model, warn, 'llm.model'),
       requestTimeoutMs,
     },
     storage: { dataDir },

@@ -434,6 +434,29 @@ def test_sidecar_orphan_pidfile_kill_and_retry(tmp_path):
     assert calls["n"] == 2
 
 
+def test_sidecar_orphan_pidfile_kill_and_retry_with_json_body(tmp_path):
+    """The sidecar writes the canonical JSON body (contract.json pidfile.body);
+    recovery must work against it, not only against bare-pid legacy bodies."""
+    pid_file = tmp_path / "sidecar.pid"
+    pid_file.write_text('{"pid":12345,"nonce":"0aff42"}', encoding="utf-8")
+    calls = {"n": 0}
+    killed = []
+
+    def probe():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    sidecar = bridge.SidecarProcess(
+        ["node", "main.js"], 8671, log=lambda _m: None,
+        popen_factory=lambda *a, **k: FakeProc(), health_probe=probe,
+        pid_file=str(pid_file), killer=killed.append, pid_alive=lambda _pid: True,
+        sleep=lambda _s: None, is_windows=False,
+    )
+    assert sidecar.start() is True
+    assert killed == [12345]
+    assert calls["n"] == 2
+
+
 def test_sidecar_orphan_pidfile_ignores_own_pid(tmp_path):
     pid_file = tmp_path / "sidecar.pid"
     pid_file.write_text("4242", encoding="utf-8")  # the pid our FakeProc reports
