@@ -87,6 +87,75 @@ Banding: `score >= sendThreshold` (0.6) → GENERATE;
 factor (plus the veto reason) is returned in a `DecisionBreakdown` for
 observability.
 
+### Send-timing walkthrough
+
+When does a session actually get its first proactive message? The four factors
+above interact in a non-obvious way, so this section walks through it with
+numbers. All figures below were produced by driving the real `decide()` /
+`evolveEmotion()` code paths (not hand math), from the state a session is left
+in right after a user reply (`valence 0.7, arousal 1.0, socialNeed 0.1`).
+
+**Factor 1 — the silence ladder dominates first-send timing.** The
+`silenceFactor` is a step function (hardcoded constants, not config): `< 60min`
+→ 0.3, `60–360min` → 0.5, `> 360min` → 0.9. Because it multiplies everything
+else, the score is capped inside the 1–6h band no matter how the other factors
+are tuned. With default emotion dynamics the in-band peak is:
+
+| window fitness | in-band peak (1–6h silence) | peak at |
+| --- | --- | --- |
+| 1.0 (07–09, 18–22) | ≈ 0.40 | ~4h silence |
+| 0.8 / 0.9 | ≈ 0.32–0.36 | — |
+| 0.7 | ≈ 0.28 | — |
+
+Since the default `sendThreshold` is 0.6, **no session can cross the threshold
+during hours 1–6 of silence**. First sends therefore happen after the 6-hour
+ladder step: `score ≈ 0.73–0.76` at ≥ 6h silence in a fitness-1.0 window, and
+the first tick inside such a window after the 6h mark wins. Practical shape:
+chat ends at noon → first outreach ~6.25h later at the next 1.0-fitness window
+(18:15); chat ends at 16:00+ → silence carries into the next morning window
+(07:00).
+
+**Factor 2 — repeat sends are gated by the ladder too, but reset-free.** The
+`silenceMs` axis is *time since the session's last message of any role* — the
+plugin's own sends do not reset it. After a first send at 6h silence, the
+session is already in the 0.9 ladder band, so subsequent sends are paced only
+by `cooldownMinutes` and `frequencyLimit` (`1 − sentThisHour / maxPerHour`):
+with defaults (cooldown 30, maxPerHour 2) roughly one send per hour, drifting
+later as fitness drops; with `cooldown 20, maxPerHour 4` the effective pace is
+~20–40min inside a 1.0-fitness window until the hourly cap zeroes
+`frequencyLimit`, then it resumes next hour.
+
+**Factor 3 — user replies reset the emotional clock.** A user message bumps
+arousal and drops `socialNeed` to its reset value (0.1). The score therefore
+falls to near zero right after a conversation and rebuilds over hours —
+proactive outreach never fires while a conversation is "warm" (this is also
+enforced by the `noSendAfterActivityMinutes` guardrail).
+
+**What this means for tuning.** Raising `sendThreshold` or lowering
+`socialNeedGrowthPerHour` changes little for *first* sends (the ladder
+dominates); the levers that actually move first-send timing are:
+
+1. **`decision.timeWindows`** — which hours have fitness ≥ the level needed.
+   First sends land at the first high-fitness window after the 6h ladder step.
+2. **`emotion.socialNeedGrowthPerHour`** — the only knob that lifts the
+   in-band peak (1–6h silence). Raising it from 0.2 to 0.4 lifts the peak from
+   ≈ 0.40 to ≈ 0.45, which together with a lower `sendThreshold` (e.g. 0.45)
+   makes 2–6h-silence first sends possible for the first time.
+3. **`decision.maxPerHour` / `cooldownMinutes`** — repeat-send density once
+   the session is in the 0.9 ladder band.
+4. **`decision.maxPerDay`** — the hard daily ceiling; with tight caps the
+   plugin front-loads its budget into high-fitness windows and goes silent
+   once exhausted.
+
+For reference, one measured 48h trace (chat ends 09:00, no user replies,
+tuned config: `sendThreshold 0.45, maxPerHour 4, maxPerDay 16, cooldown 20`,
+default windows + a 12–14 lunch window at 0.9): first send 15:05 (6.1h
+silence), 11 sends the first day spread across the afternoon and evening
+windows, then 5 sends the next morning after quiet hours lift — 16 total, vs
+8 total under default parameters. Same trace under default parameters:
+first send 18:00 (9h silence), one send per hour through the evening window,
+nothing else until the next morning.
+
 ### HOLD stubs
 
 The HOLD band never spends an LLM call. Instead it enqueues a contentless

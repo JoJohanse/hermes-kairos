@@ -23,6 +23,7 @@
   - [Verify](#verify)
   - [Notes](#notes)
 - [Configuration](#configuration)
+- [How send timing is computed](#how-send-timing-is-computed)
 
 ---
 
@@ -229,3 +230,76 @@ survives restarts. See
 [`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md)
 for the full plugin behavior, persistence semantics and configuration
 reference.
+
+## How send timing is computed
+
+When does a proactive message actually go out? The gate is a single score:
+
+```
+score = intensity × timeFitness × silenceFactor × frequencyLimit
+intensity      = (valence + arousal + 3 × socialNeed) / 5
+timeFitness    = 07–09:1.0, 09–12:0.8, 12–18:0.7, 18–22:1.0, 22–23:30:0.5, else 0
+silenceFactor  = <60min:0.3, 60–360min:0.5, >360min:0.9
+frequencyLimit = max(0.1, 1 - sentThisHour / maxPerHour)
+```
+
+A send fires when `score >= sendThreshold` (default 0.6); all four factors
+vary dynamically over time. The numbers below were measured by driving the
+real `decide()` / `evolveEmotion()` code paths (not hand math), starting from
+the state right after a user reply (`valence 0.7, arousal 1.0, socialNeed
+0.1`).
+
+**Mechanism 1 — the silence ladder dominates first sends.** `silenceFactor`
+is a step function of silence duration (hardcoded constants, not config):
+`< 1h` → 0.3, `1–6h` → 0.5, `> 6h` → 0.9. Because it multiplies the whole
+score, hours 1–6 of silence are capped regardless of tuning:
+
+| Window fitness | In-band peak (1–6h silence) | Peak at |
+| --- | --- | --- |
+| 1.0 (07–09, 18–22) | ≈ 0.40 | ~4h silence |
+| 0.8 / 0.9 | ≈ 0.32–0.36 | — |
+| 0.7 | ≈ 0.28 | — |
+
+With the default threshold of 0.6, **a first send during hours 1–6 of silence
+is impossible**. First sends land after the 6-hour ladder step: `score ≈
+0.73–0.76` at ≥ 6h silence inside a fitness-1.0 window, and the first tick in
+such a window after the 6h mark wins. Practical shape: chat ends at noon →
+first outreach ≈ 6.25h later at the next 1.0-fitness window (18:15); chat
+ends after 16:00 → the silence carries into the next morning window (07:00).
+
+**Mechanism 2 — repeat sends are not ladder-reset.** The `silenceMs` axis is
+*time since the session's last message of any role* — the plugin's own sends
+do **not** reset it. After a first send the session is already in the 0.9
+ladder band, so later sends are paced only by `cooldownMinutes` and
+`frequencyLimit` (`1 − sentThisHour / maxPerHour`): roughly one per hour with
+defaults, or every ~20–40 minutes with `cooldown 20 + maxPerHour 4` inside a
+1.0-fitness window until the hourly cap zeroes `frequencyLimit` (it resumes
+next hour).
+
+**Mechanism 3 — user replies reset the emotional clock.** A user message
+bumps arousal and drops `socialNeed` to its reset value (0.1), so the score
+collapses to near zero right after a conversation and rebuilds over hours —
+proactive outreach never fires while a conversation is "warm" (the
+`noSendAfterActivityMinutes` guardrail enforces this too).
+
+**Tuning guide.** For *first* sends, `sendThreshold` and the emotion knobs
+matter little (the ladder dominates). The levers that actually move timing:
+
+1. **`decision.timeWindows`** — which hours have a high enough fitness. First
+   sends land at the first high-fitness window after the 6h ladder step.
+2. **`emotion.socialNeedGrowthPerHour`** — the only knob that lifts the
+   in-band peak (1–6h silence): 0.2 → 0.4 raises the peak from ≈ 0.40 to
+   ≈ 0.45, which together with a lower `sendThreshold` (e.g. 0.45) makes
+   2–6h-silence first sends possible for the first time.
+3. **`decision.maxPerHour` / `cooldownMinutes`** — repeat-send density after
+   the first send.
+4. **`decision.maxPerDay`** — the hard daily ceiling; a tight budget gets
+   front-loaded into high-fitness windows and the plugin goes silent once
+   exhausted.
+
+For reference, one measured 48h trace (chat ends 09:00, no user replies,
+tuned config `sendThreshold 0.45 / maxPerHour 4 / maxPerDay 16 / cooldown
+20`): first send 15:05 (6.1h silence), 11 sends across the afternoon and
+evening windows on day 1, then 5 more the next morning after quiet hours
+lift — 16 total, vs 8 total under default parameters (first send 18:00, one
+per hour through the evening window).

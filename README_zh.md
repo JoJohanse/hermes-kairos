@@ -23,6 +23,7 @@
   - [验证](#验证)
   - [注意事项](#注意事项)
 - [配置](#配置)
+- [发送时机是怎么算出来的](#发送时机是怎么算出来的)
 
 ---
 
@@ -222,3 +223,63 @@ npm test         # vitest run（测试与源码同目录，*.test.ts）
 
 会话/消息保留在内核内存中（持久化属于部署层面的事）。但 proactive-chat 插件会把自身的会话状态（情绪、HOLD stub、发送时间戳）快照到 `storage.dataDir`，重启后自动恢复。完整的插件行为、持久化语义与配置参考见
 [`src/builtins/proactive-chat/README.md`](src/builtins/proactive-chat/README.md)。
+
+## 发送时机是怎么算出来的
+
+主动消息什么时候发？打分公式是：
+
+```
+score = intensity × timeFitness × silenceFactor × frequencyLimit
+intensity      = (valence + arousal + 3 × socialNeed) / 5
+timeFitness    = 07–09:1.0, 09–12:0.8, 12–18:0.7, 18–22:1.0, 22–23:30:0.5, 其余为 0
+silenceFactor  = <60min:0.3, 60–360min:0.5, >360min:0.9
+frequencyLimit = max(0.1, 1 - sentThisHour / maxPerHour)
+```
+
+`score ≥ sendThreshold`(默认 0.6)即触发发送；四个因子都随时间动态变化。
+以下数字均由真实 `decide()` / `evolveEmotion()` 代码路径实测得出(非手算),
+初始状态为"用户刚回复完"(`valence 0.7, arousal 1.0, socialNeed 0.1`)。
+
+**关键机制 1 —— 静默阶梯主导首发时机。** `silenceFactor` 是阶梯函数
+(硬编码常量,不可配置):沉默 <1 小时 = 0.3,1–6 小时 = 0.5,>6 小时 = 0.9。
+它连乘在整体分数上,所以 1–6 小时区间内无论怎么调参,分数都被压住:
+
+| 时段适应度 | 1–6h 静默内分数峰值 | 峰值时刻 |
+| --- | --- | --- |
+| 1.0(07–09、18–22) | ≈ 0.40 | 沉默约 4h |
+| 0.8 / 0.9 | ≈ 0.32–0.36 | — |
+| 0.7 | ≈ 0.28 | — |
+
+默认阈值 0.6 之下,**沉默 1–6 小时期间不可能首发**。首发实际发生在静默跨过
+6 小时阶梯之后:此时 fitness=1.0 的时段里 `score ≈ 0.73–0.76`,跨过 6h 后
+遇到的第一个高分时段即触发。体感规律:中午聊完 → 约 6.25 小时后首发
+(落在下一个 1.0 时段,如 18:15);下午 16 点后聊完 → 静默延续到次日早晨
+(07:00 首发)。
+
+**关键机制 2 —— 重复发送不受阶梯重置。** `silenceMs` 的计时轴是"会话最后
+一条消息(任意角色)"——插件自己发的消息**不会**重置它。首发之后会话已在
+0.9 阶梯档,后续发送只由 `cooldownMinutes` 和 `frequencyLimit`
+(`1 − sentThisHour / maxPerHour`)调节:默认参数下约每小时 1 条;调成
+`cooldown 20 + maxPerHour 4` 后,高峰时段约 20–40 分钟一条,直到小时上限
+把 `frequencyLimit` 压到 0,下一个整小时恢复。
+
+**关键机制 3 —— 用户回复重置情绪时钟。** 用户一条消息会把 arousal 抬升、
+`socialNeed` 重置到 0.1,分数瞬间跌回接近零、再花数小时爬升。所以会话
+"热聊中"永远不会触发主动消息(另有 `noSendAfterActivityMinutes` 护栏兜底)。
+
+**调参指南。** 对**首发**时机而言,调 `sendThreshold` 或情绪参数影响很小
+(阶梯主导),真正有效的旋钮是:
+
+1. **`decision.timeWindows`** —— 哪些时段 fitness 够高。首发落在静默跨过
+   6h 之后的第一个高分时段。
+2. **`emotion.socialNeedGrowthPerHour`** —— 唯一能抬高 1–6h 静默区峰值的
+   旋钮:从 0.2 提到 0.4,峰值从 ≈0.40 升到 ≈0.45,配合更低的
+   `sendThreshold`(如 0.45)即可让 2–6 小时静默内的首次主动消息成为可能。
+3. **`decision.maxPerHour` / `cooldownMinutes`** —— 控制首发之后的连发密度。
+4. **`decision.maxPerDay`** —— 每日硬上限;预算吃紧时插件会把额度集中在
+   高分时段,耗尽后当天静默。
+
+实测参考(48 小时,09:00 聊完、用户不回复,调优配置
+`sendThreshold 0.45 / maxPerHour 4 / maxPerDay 16 / cooldown 20`):首发
+15:05(沉默 6.1h),当天下午+晚间共 11 条,次日早晨安静时段结束后再 5 条,
+合计 16 条;同场景默认参数合计 8 条(首发 18:00,晚间每小时 1 条)。
